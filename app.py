@@ -84,7 +84,7 @@ banco = st.radio(
 # Asignar nombres de columnas según el banco
 if banco == "Banco Credicoop":
     concepto_col = "Concepto"
-    debito_col = "Débitos"
+    debito_col = "Débito"
 else:  # Banco Galicia
     concepto_col = "Descripción"
     debito_col = "Debitos"
