@@ -87,7 +87,7 @@ if banco == "Banco Credicoop":
     debito_col = "Débito"
 else:  # Banco Galicia
     concepto_col = "Descripción"
-    debito_col = "Debitos"
+    debito_col = "Débitos"
 
 st.write(f"👉 Se analizarán las columnas: **{concepto_col}** y **{debito_col}**")
 
