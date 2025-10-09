@@ -1,3 +1,4 @@
+# app.py
 import streamlit as st
 import pandas as pd
 
@@ -21,78 +22,66 @@ def find_fecha_column(df):
             return col
     return None
 
-def analyze_data(df, concepto_col, debito_col):
+def analyze_data(df):
     total_impuestos = 0.0
     total_especial = 0.0
     detalles_especial = pd.DataFrame(columns=['Fecha','Concepto','Débito'])
 
-    if concepto_col not in df.columns or debito_col not in df.columns:
-        st.error(f"El archivo debe contener las columnas '{concepto_col}' y '{debito_col}'.")
+    if 'Concepto' not in df.columns or 'Débito' not in df.columns:
+        st.error("El archivo debe contener las columnas 'Concepto' y 'Débito'.")
         return total_impuestos, total_especial, detalles_especial
 
     fecha_col = find_fecha_column(df)
 
     for _, row in df.iterrows():
-        concepto_row = str(row.get(concepto_col, '')).strip()
+        concepto_row = str(row.get('Concepto', '')).strip()
         # normales
         if any(concepto_row.startswith(c) for c in CONCEPTOS_A_COMPARAR):
             try:
-                total_impuestos += float(str(row.get(debito_col, '')).replace(',', ''))
+                total_impuestos += float(str(row.get('Débito', '')).replace(',', ''))
             except:
                 pass
         # especial
         if concepto_row.startswith(CONCEPTO_ESPECIAL):
             try:
-                val = float(str(row.get(debito_col, '')).replace(',', ''))
+                val = float(str(row.get('Débito', '')).replace(',', ''))
                 total_especial += val
-                detalles_especial = pd.concat([detalles_especial, pd.DataFrame([{
-                    'Fecha': row.get(fecha_col, '') if fecha_col else '',
-                    'Concepto': concepto_row,
-                    'Débito': row.get(debito_col, '')
-                }])], ignore_index=True)
+                detalles_especial = pd.concat([
+                    detalles_especial,
+                    pd.DataFrame([{
+                        'Fecha': row.get(fecha_col, '') if fecha_col else '',
+                        'Concepto': concepto_row,
+                        'Débito': row.get('Débito', '')
+                    }])
+                ], ignore_index=True)
             except:
                 pass
 
     return total_impuestos, total_especial, detalles_especial
 
-def summarize_per_concept(df, concepto_col, debito_col):
+def summarize_per_concept(df):
     suma_por_concepto = {}
     for concepto in CONCEPTOS_A_COMPARAR:
-        mask = df[concepto_col].astype(str).apply(lambda x: x.startswith(concepto))
-        suma_por_concepto[concepto] = pd.to_numeric(df[mask][debito_col], errors='coerce').sum()
-
+        mask = df['Concepto'].astype(str).apply(lambda x: x.startswith(concepto))
+        suma_por_concepto[concepto] = pd.to_numeric(df[mask]['Débito'], errors='coerce').sum()
     summary = pd.DataFrame(list(suma_por_concepto.items()), columns=['Concepto','Total Débito'])
     total_general = summary['Total Débito'].sum()
-    summary = pd.concat([summary, pd.DataFrame([['TOTAL GENERAL', total_general]], columns=['Concepto','Total Débito'])], ignore_index=True)
-
-    mask_especial = df[concepto_col].astype(str).apply(lambda x: x.startswith(CONCEPTO_ESPECIAL))
-    total_especial = pd.to_numeric(df[mask_especial][debito_col], errors='coerce').sum()
+    summary = pd.concat([
+        summary,
+        pd.DataFrame([['TOTAL GENERAL', total_general]], columns=['Concepto','Total Débito'])
+    ], ignore_index=True)
+    mask_especial = df['Concepto'].astype(str).apply(lambda x: x.startswith(CONCEPTO_ESPECIAL))
+    total_especial = pd.to_numeric(df[mask_especial]['Débito'], errors='coerce').sum()
     summary = pd.concat([summary, pd.DataFrame([[CONCEPTO_ESPECIAL, total_especial]], columns=['Concepto','Total Débito'])], ignore_index=True)
-
     return summary
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Analizador Bancario", layout="wide")
 st.title("📊 Analizador de Conceptos Bancarios")
 
-# Selección del banco
-banco = st.radio(
-    "Seleccioná el banco del archivo que vas a analizar:",
-    ("Banco Credicoop", "Banco Galicia")
-)
+st.write("Subí un archivo Excel o CSV con las columnas **Concepto** y **Débito** para analizarlo.")
 
-# Asignar nombres de columnas según el banco
-if banco == "Banco Credicoop":
-    concepto_col = "Concepto"
-    debito_col = "Débitos"
-else:  # Banco Galicia
-    concepto_col = "Descripción"
-    debito_col = "Debitos"
-
-st.write(f"👉 Se analizarán las columnas: **{concepto_col}** y **{debito_col}**")
-
-# Subida del archivo
-uploaded_file = st.file_uploader("Elegir archivo Excel o CSV", type=["xlsx", "xls", "csv"])
+uploaded_file = st.file_uploader("Elegir archivo", type=["xlsx", "xls", "csv"])
 if uploaded_file:
     try:
         if uploaded_file.name.lower().endswith(".csv"):
@@ -103,8 +92,8 @@ if uploaded_file:
         st.success(f"Archivo cargado: {uploaded_file.name}")
         st.dataframe(df.head())
 
-        total_impuestos, total_especial, detalles_especial = analyze_data(df, concepto_col, debito_col)
-        summary = summarize_per_concept(df, concepto_col, debito_col)
+        total_impuestos, total_especial, detalles_especial = analyze_data(df)
+        summary = summarize_per_concept(df)
 
         st.markdown("### Resultados generales")
         st.write(f"**Suma total de impuestos (conceptos normales):** {total_impuestos:,.2f}")
