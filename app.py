@@ -2,7 +2,16 @@ import streamlit as st
 import pandas as pd
 
 # --- CONFIG GENERAL ---
-CONCEPTO_ESPECIAL = "Debito Automatico Directo FEDERACION PATRO"
+# Conceptos especiales con variaciones
+CONCEPTOS_ESPECIALES = {
+    "AGUAS BONAERENSES": ["aguas bonaerenses", "aguasbonaerenses"],
+    "CONSORCIO ABIERT": ["consorcio abiert"],
+    "CAMUZZI": ["camuzzi"],
+    "SAN CRISTOBAL": ["san cristobal"],
+    "CABLEVISION": ["cablevision"],
+    "EDES": ["edes"],
+    "ARCA VEP": ["arca vep"]
+}
 
 # --- STREAMLIT UI ---
 st.set_page_config(page_title="Analizador Bancario", layout="wide")
@@ -53,13 +62,13 @@ def find_fecha_column(df):
 
 def analyze_data(df, col_concepto, col_debito):
     total_impuestos = 0.0
-    total_especial = 0.0
-    detalles_especial = pd.DataFrame(columns=['Fecha','Concepto','Débito'])
-
     fecha_col = find_fecha_column(df)
+
+    detalles_especiales = pd.DataFrame(columns=['Fecha','Concepto','Débito','Grupo'])
 
     for _, row in df.iterrows():
         concepto_row = str(row.get(col_concepto, '')).strip()
+        concepto_lower = concepto_row.lower()
 
         # Conceptos normales
         if any(concepto_row.startswith(c) for c in CONCEPTOS_A_COMPARAR):
@@ -68,23 +77,24 @@ def analyze_data(df, col_concepto, col_debito):
             except:
                 pass
 
-        # Concepto especial
-        if concepto_row.startswith(CONCEPTO_ESPECIAL):
-            try:
-                val = float(str(row.get(col_debito, '')).replace(',', ''))
-                total_especial += val
-                detalles_especial = pd.concat([
-                    detalles_especial,
-                    pd.DataFrame([{
-                        'Fecha': row.get(fecha_col, '') if fecha_col else '',
-                        'Concepto': concepto_row,
-                        'Débito': formato_argentino(val)
-                    }])
-                ], ignore_index=True)
-            except:
-                pass
+        # Conceptos especiales (busca si contiene alguna palabra clave)
+        for grupo, keywords in CONCEPTOS_ESPECIALES.items():
+            if any(k in concepto_lower for k in keywords):
+                try:
+                    val = float(str(row.get(col_debito, '')).replace(',', ''))
+                    detalles_especiales = pd.concat([
+                        detalles_especiales,
+                        pd.DataFrame([{
+                            'Fecha': row.get(fecha_col, '') if fecha_col else '',
+                            'Concepto': concepto_row,
+                            'Débito': formato_argentino(val),
+                            'Grupo': grupo
+                        }])
+                    ], ignore_index=True)
+                except:
+                    pass
 
-    return total_impuestos, total_especial, detalles_especial
+    return total_impuestos, detalles_especiales
 
 def summarize_per_concept(df, col_concepto, col_debito):
     suma_por_concepto = {}
@@ -98,15 +108,6 @@ def summarize_per_concept(df, col_concepto, col_debito):
         summary,
         pd.DataFrame([['TOTAL GENERAL', total_general]], columns=['Concepto','Total Débito'])
     ], ignore_index=True)
-
-    # Concepto especial
-    mask_especial = df[col_concepto].astype(str).apply(lambda x: x.startswith(CONCEPTO_ESPECIAL))
-    total_especial = pd.to_numeric(df[mask_especial][col_debito], errors='coerce').sum()
-    if total_especial > 0:
-        summary = pd.concat([
-            summary,
-            pd.DataFrame([[CONCEPTO_ESPECIAL, total_especial]], columns=['Concepto','Total Débito'])
-        ], ignore_index=True)
 
     # Aplicar formato argentino
     summary['Total Débito'] = summary['Total Débito'].apply(formato_argentino)
@@ -125,21 +126,27 @@ if uploaded_file:
         st.success(f"Archivo cargado: {uploaded_file.name}")
         st.dataframe(df.head())
 
-        total_impuestos, total_especial, detalles_especial = analyze_data(df, col_concepto, col_debito)
+        total_impuestos, detalles_especiales = analyze_data(df, col_concepto, col_debito)
         summary = summarize_per_concept(df, col_concepto, col_debito)
 
         st.markdown("### Resultados generales")
         st.write(f"**Suma total de impuestos (conceptos normales):** {formato_argentino(total_impuestos)}")
-        st.write(f"**Suma total del concepto especial (‘{CONCEPTO_ESPECIAL}’):** {formato_argentino(total_especial)}")
 
         st.markdown("### Resumen por concepto")
         st.dataframe(summary)
 
-        if not detalles_especial.empty:
-            st.markdown(f"### Detalle del concepto especial: {CONCEPTO_ESPECIAL}")
-            st.dataframe(detalles_especial[['Fecha','Concepto','Débito']])
+        # Mostrar conceptos especiales agrupados
+        if not detalles_especiales.empty:
+            st.markdown("### Detalle de conceptos especiales")
+            for grupo in CONCEPTOS_ESPECIALES.keys():
+                grupo_df = detalles_especiales[detalles_especiales['Grupo'] == grupo]
+                if not grupo_df.empty:
+                    subtotal = sum([float(str(x).replace('.','').replace(',','.')) for x in grupo_df['Débito']])
+                    with st.expander(f"📌 {grupo} ({len(grupo_df)} registros) - Total: {formato_argentino(subtotal)}"):
+                        st.dataframe(grupo_df[['Fecha','Concepto','Débito']])
         else:
-            st.info(f"No se encontraron registros del concepto especial '{CONCEPTO_ESPECIAL}'.")
+            st.info("No se encontraron registros de conceptos especiales.")
 
     except Exception as e:
         st.error(f"Error procesando el archivo: {e}")
+

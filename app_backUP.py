@@ -39,6 +39,12 @@ st.write(f"Configurado para analizar archivos de **{banco}** usando las columnas
 st.write("Subí un archivo Excel o CSV con los datos bancarios para analizarlo.")
 
 # --- FUNCIONES AUXILIARES ---
+def formato_argentino(valor):
+    try:
+        return format(valor, ',.2f').replace(',', 'X').replace('.', ',').replace('X', '.')
+    except:
+        return valor
+
 def find_fecha_column(df):
     for col in df.columns:
         if 'fecha' in str(col).lower() or 'date' in str(col).lower():
@@ -72,7 +78,7 @@ def analyze_data(df, col_concepto, col_debito):
                     pd.DataFrame([{
                         'Fecha': row.get(fecha_col, '') if fecha_col else '',
                         'Concepto': concepto_row,
-                        'Débito': row.get(col_debito, '')
+                        'Débito': formato_argentino(val)
                     }])
                 ], ignore_index=True)
             except:
@@ -102,6 +108,9 @@ def summarize_per_concept(df, col_concepto, col_debito):
             pd.DataFrame([[CONCEPTO_ESPECIAL, total_especial]], columns=['Concepto','Total Débito'])
         ], ignore_index=True)
 
+    # Aplicar formato argentino
+    summary['Total Débito'] = summary['Total Débito'].apply(formato_argentino)
+
     return summary
 
 # --- CARGA DE ARCHIVO ---
@@ -120,8 +129,8 @@ if uploaded_file:
         summary = summarize_per_concept(df, col_concepto, col_debito)
 
         st.markdown("### Resultados generales")
-        st.write(f"**Suma total de impuestos (conceptos normales):** {total_impuestos:,.2f}")
-        st.write(f"**Suma total del concepto especial (‘{CONCEPTO_ESPECIAL}’):** {total_especial:,.2f}")
+        st.write(f"**Suma total de impuestos (conceptos normales):** {formato_argentino(total_impuestos)}")
+        st.write(f"**Suma total del concepto especial (‘{CONCEPTO_ESPECIAL}’):** {formato_argentino(total_especial)}")
 
         st.markdown("### Resumen por concepto")
         st.dataframe(summary)
