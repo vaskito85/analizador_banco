@@ -12,7 +12,8 @@ CONCEPTOS_ESPECIALES = {
     "EDES": ["edes"],
     "ARCA VEP": ["arca vep"],
     "BVNET": ["bvnet"],
-    "Maria Luisa": ["maria luisa"]
+    "Maria Luisa": ["maria luisa"],
+    "SODAGO": ["sodago"]
 }
 
 # --- STREAMLIT UI ---
@@ -31,7 +32,7 @@ if banco == "Banco Credicoop":
         "Com. mantenimiento cuenta",
         "Impuesto Ley 25.413 Ali Gral s/Creditos",
         "Comision por Transferencia B. INTERNET COM.",
-        "Suscripcion al Periodico Accion",
+        "Suscripcion al Periodico Accion",  # ya contemplado
         "Contracargos a comercios First Data MASTER CONTRACARGO"
     ]
     col_concepto = "Concepto"
