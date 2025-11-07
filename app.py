@@ -11,7 +11,8 @@ CONCEPTOS_ESPECIALES = {
     "CABLEVISION": ["cablevision"],
     "EDES": ["edes"],
     "ARCA VEP": ["arca vep"],
-    "BVNET": ["bvnet"]
+    "BVNET": ["bvnet"],
+    "Maria Luisa": ["maria luisa"]
 }
 
 # --- STREAMLIT UI ---
