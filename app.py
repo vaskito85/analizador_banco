@@ -10,7 +10,8 @@ CONCEPTOS_ESPECIALES = {
     "SAN CRISTOBAL": ["san cristobal"],
     "CABLEVISION": ["cablevision"],
     "EDES": ["edes"],
-    "ARCA VEP": ["arca vep"]
+    "ARCA VEP": ["arca vep"],
+    "BVNET": ["bvnet"]
 }
 
 # --- STREAMLIT UI ---
@@ -141,6 +142,7 @@ if uploaded_file:
             for grupo in CONCEPTOS_ESPECIALES.keys():
                 grupo_df = detalles_especiales[detalles_especiales['Grupo'] == grupo]
                 if not grupo_df.empty:
+                    # Calcular subtotal del grupo
                     subtotal = sum([float(str(x).replace('.','').replace(',','.')) for x in grupo_df['Débito']])
                     with st.expander(f"📌 {grupo} ({len(grupo_df)} registros) - Total: {formato_argentino(subtotal)}"):
                         st.dataframe(grupo_df[['Fecha','Concepto','Débito']])
@@ -149,4 +151,3 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Error procesando el archivo: {e}")
-
