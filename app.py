@@ -4,9 +4,9 @@ import pandas as pd
 # --- CONFIG GENERAL ---
 CONCEPTOS_ESPECIALES = {
     "AGUAS BONAERENSES": ["aguas bonaerenses", "aguasbonaerenses"],
-    "CONSORCIO ABIERT": ["consorcio abiert", "debito directo consorcio abiert-000"],
+    "CONSORCIO ABIERT": ["consorcio abiert"],
     "CAMUZZI": ["camuzzi"],
-    "SAN CRISTOBAL": ["san cristobal", "debito directo san cristobal sg-040"],
+    "SAN CRISTOBAL": ["san cristobal"],
     "CABLEVISION": ["cablevision"],
     "EDES": ["edes"],
     "ARCA VEP": ["arca vep"],
@@ -52,6 +52,8 @@ elif banco == "Banco Galicia":
 elif banco == "Banco Roela":
     CONCEPTOS_A_COMPARAR = [
         "IMPUESTO LEY 25413",
+        "IMPUESTO LEY 25413 CONSORCIO ABIERT",
+        "IMPUESTO LEY 25413 SAN CRISTOBAL SG",
         "COM. ONLINE SIRO ELECTRONICOS",
         "I.V.A.",
         "COM.MANTENIMIENTO CUENTA MENSUAL",
@@ -179,4 +181,5 @@ if uploaded_file:
 
 # --- VERSIÓN DEL SCRIPT ---
 st.markdown("---")
-st.markdown("🛠️ **Versión del script: v12**")
+st.markdown("🛠️ **Versión del script: v13**")
+
