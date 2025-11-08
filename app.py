@@ -134,17 +134,25 @@ def summarize_per_concept(df, col_concepto, col_debito, invertir_signo):
 uploaded_file = st.file_uploader("Elegir archivo", type=["xlsx", "xls", "csv"])
 if uploaded_file:
     try:
+        # --- CARGA ROBUSTA DEL ARCHIVO ---
         if uploaded_file.name.lower().endswith(".csv"):
             try:
-                df = pd.read_csv(uploaded_file, encoding='utf-8')
+                df = pd.read_csv(uploaded_file, encoding='utf-8', sep=None, engine='python')
             except UnicodeDecodeError:
-                df = pd.read_csv(uploaded_file, encoding='latin1')
+                df = pd.read_csv(uploaded_file, encoding='latin1', sep=None, engine='python')
         else:
             df = pd.read_excel(uploaded_file)
 
-        st.success(f"Archivo cargado: {uploaded_file.name}")
-        st.dataframe(df.head())
+        # --- VERIFICACIÓN DE ESTRUCTURA ---
+        if df.empty or df.columns.size == 0:
+            st.error("El archivo está vacío o no tiene columnas reconocibles. Verificá el formato y el separador.")
+            st.stop()
 
+        st.success(f"Archivo cargado: {uploaded_file.name}")
+        st.markdown("### 🧾 Vista preliminar del archivo (primera línea)")
+        st.dataframe(df.head(1))  # 👈 muestra solo la primera línea
+
+        # --- ANÁLISIS ---
         total_impuestos, detalles_especiales = analyze_data(df, col_concepto, col_debito, invertir_signo)
         summary = summarize_per_concept(df, col_concepto, col_debito, invertir_signo)
 
@@ -167,4 +175,3 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Error procesando el archivo: {e}")
-
