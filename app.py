@@ -135,7 +135,10 @@ uploaded_file = st.file_uploader("Elegir archivo", type=["xlsx", "xls", "csv"])
 if uploaded_file:
     try:
         if uploaded_file.name.lower().endswith(".csv"):
-            df = pd.read_csv(uploaded_file)
+            try:
+                df = pd.read_csv(uploaded_file, encoding='utf-8')
+            except UnicodeDecodeError:
+                df = pd.read_csv(uploaded_file, encoding='latin1')
         else:
             df = pd.read_excel(uploaded_file)
 
