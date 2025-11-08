@@ -136,6 +136,11 @@ if uploaded_file:
     try:
         if uploaded_file.name.lower().endswith(".csv"):
             df = pd.read_csv(uploaded_file, encoding='latin1', sep=';')
+
+            # --- LIMPIEZA DE COLUMNAS Y VALORES ---
+            df.columns = df.columns.str.strip().str.replace(r'\s+', ' ', regex=True)
+            for col in df.select_dtypes(include=['object']).columns:
+                df[col] = df[col].str.strip()
         else:
             df = pd.read_excel(uploaded_file)
 
@@ -171,3 +176,7 @@ if uploaded_file:
 
     except Exception as e:
         st.error(f"Error procesando el archivo: {e}")
+
+# --- VERSIÓN DEL SCRIPT ---
+st.markdown("---")
+st.markdown("🛠️ **Versión del script: v12**")
