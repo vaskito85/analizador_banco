@@ -86,7 +86,7 @@ def analyze_data(df, col_concepto, col_debito, invertir_signo):
         concepto_row = str(row.get(col_concepto, '')).strip()
         concepto_lower = concepto_row.lower()
         try:
-            monto = float(str(row.get(col_debito, '')).replace(',', ''))
+            monto = float(str(row.get(col_debito, '')).replace(',', '.'))
             if invertir_signo and monto < 0:
                 monto = -monto
         except:
@@ -115,7 +115,7 @@ def summarize_per_concept(df, col_concepto, col_debito, invertir_signo):
     suma_por_concepto = {}
     for concepto in CONCEPTOS_A_COMPARAR:
         mask = df[col_concepto].astype(str).str.lower().str.startswith(concepto.lower())
-        valores = pd.to_numeric(df[mask][col_debito], errors='coerce')
+        valores = pd.to_numeric(df[mask][col_debito].astype(str).str.replace(',', '.'), errors='coerce')
         if invertir_signo:
             valores = valores[valores < 0] * -1
         suma_por_concepto[concepto] = valores.sum()
@@ -131,26 +131,22 @@ def summarize_per_concept(df, col_concepto, col_debito, invertir_signo):
     return summary
 
 # --- CARGA DE ARCHIVO ---
-uploaded_file = st.file_uploader("Elegir archivo", type=["xlsx", "xls", "csv"])
+uploaded_file = st.file_uploader("Elegir archivo", type=["csv", "xlsx", "xls"])
 if uploaded_file:
     try:
-        # --- CARGA ROBUSTA DEL ARCHIVO ---
         if uploaded_file.name.lower().endswith(".csv"):
-            try:
-                df = pd.read_csv(uploaded_file, encoding='utf-8', sep=None, engine='python')
-            except UnicodeDecodeError:
-                df = pd.read_csv(uploaded_file, encoding='latin1', sep=None, engine='python')
+            df = pd.read_csv(uploaded_file, encoding='latin1', sep=';')
         else:
             df = pd.read_excel(uploaded_file)
 
-        # --- VERIFICACIÓN DE ESTRUCTURA ---
         if df.empty or df.columns.size == 0:
-            st.error("El archivo está vacío o no tiene columnas reconocibles. Verificá el formato y el separador.")
+            st.error("El archivo está vacío o no tiene columnas reconocibles.")
             st.stop()
 
         st.success(f"Archivo cargado: {uploaded_file.name}")
+        st.write("📑 Columnas detectadas:", list(df.columns))
         st.markdown("### 🧾 Vista preliminar del archivo (primera línea)")
-        st.dataframe(df.head(1))  # 👈 muestra solo la primera línea
+        st.dataframe(df.head(1))
 
         # --- ANÁLISIS ---
         total_impuestos, detalles_especiales = analyze_data(df, col_concepto, col_debito, invertir_signo)
