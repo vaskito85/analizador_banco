@@ -57,8 +57,8 @@ elif banco == "Banco Roela":
         "COM.MANTENIMIENTO CUENTA MENSUAL",
         "TR.INTERB. DIST.TIT. 30717991946-BA"
     ]
-    col_concepto = "descripcion"
-    col_debito = "monto"
+    col_concepto = "Descripción"
+    col_debito = "Monto"
     invertir_signo = True
 
 st.write(f"Configurado para analizar archivos de **{banco}** usando las columnas **{col_concepto}** y **{col_debito}**.")
