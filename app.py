@@ -13,7 +13,17 @@ CONCEPTOS_ESPECIALES = {
     "BVNET": ["bvnet"],
     "Maria Luisa": ["maria luisa"],
     "SODAGO": ["sodago"],
-    "PAGO AUTOMATICO SERVICIOS": ["pago automatico servicios"]
+    "PAGO AUTOMATICO SERVICIOS": ["pago automatico servicios"],
+
+    # --- NUEVO CONCEPTO ESPECIAL ---
+    "FEDERACION PATRO": [
+        "federacion patro",
+        "federación patro",
+        "federacion patronal",
+        "federación patronal",
+        "seguro federacion patronal",
+        "seguro federación patronal"
+    ]
 }
 
 # --- STREAMLIT UI ---
@@ -181,5 +191,4 @@ if uploaded_file:
 
 # --- VERSIÓN DEL SCRIPT ---
 st.markdown("---")
-st.markdown("🛠️ **Versión del script: v13**")
-
+st.markdown("🛠️ **Versión del script: v14**")
