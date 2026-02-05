@@ -3,7 +3,7 @@ import pandas as pd
 import re
 import unicodedata
 from io import BytesIO
-import pdfplumber  # <-- NUEVO: para extraer tablas desde PDF
+import pdfplumber  # para extraer tablas desde PDF
 
 # ==========================
 # === CONFIG GENERAL =======
@@ -95,10 +95,10 @@ def guess_column(df, candidates):
 
 def ensure_clean_columns(df):
     # Limpia nombres de columnas tanto para CSV, Excel como PDF parseado
-    df.columns = (df.columns
-                  .astype(str)
-                  .str.strip()
-                  .str.replace(r'\s+', ' ', regex=True))
+    df.columns = (pd.Index(df.columns)
+                    .astype(str)
+                    .str.strip()
+                    .str.replace(r'\s+', ' ', regex=True))
     # Limpia strings base
     for col in df.select_dtypes(include=['object']).columns:
         df[col] = df[col].astype(str).str.strip()
@@ -111,6 +111,23 @@ def conceptos_regex(keywords):
     kws = [_re.escape(normalize_text(k)) for k in keywords]
     return r'(' + '|'.join(kws) + r')'
 
+def _dedup_columns(cols):
+    """
+    Deduplica nombres de columnas preservando orden.
+    Ej.: ["Fecha", "Fecha", "Monto"] -> ["Fecha", "Fecha.1", "Monto"]
+    """
+    out = []
+    seen = {}
+    for c in cols:
+        name = str(c) if c is not None else ""
+        if name not in seen:
+            seen[name] = 0
+            out.append(name)
+        else:
+            seen[name] += 1
+            out.append(f"{name}.{seen[name]}")
+    return out
+
 # ==========================
 # === PDF PARSER ===========
 # ==========================
@@ -119,15 +136,10 @@ def parse_pdf_to_dataframe(uploaded_pdf, banco: str) -> pd.DataFrame:
     """
     Extrae tablas de un PDF usando pdfplumber.
     Devuelve un DataFrame concatenado y limpio.
-    Notas:
-      - Si hay múltiples tablas por página, las concatena.
-      - Intenta usar la primera fila de cada tabla como encabezado si parece header.
-      - Filtra columnas vacías/duplicadas.
     """
     tables = []
     with pdfplumber.open(uploaded_pdf) as pdf:
         for page in pdf.pages:
-            # table_settings ayudan con líneas débiles o celdas sin bordes
             extracted = page.extract_tables(table_settings={
                 "vertical_strategy": "lines",
                 "horizontal_strategy": "lines",
@@ -136,46 +148,37 @@ def parse_pdf_to_dataframe(uploaded_pdf, banco: str) -> pd.DataFrame:
                 "join_tolerance": 3,
                 "edge_min_length": 10,
             })
-            # Si no detecta líneas, probamos la heurística "text-based"
             if not extracted or len(extracted) == 0:
-                extracted = page.extract_tables()  # fallback default
+                extracted = page.extract_tables()  # fallback
 
             for tbl in extracted or []:
                 if not tbl or len(tbl) == 0:
                     continue
-                # Heurística: si la primera fila parece encabezado (más “texto” que números), úsala como header
                 header = tbl[0]
                 body = tbl[1:] if len(tbl) > 1 else []
-                # Si header tiene al menos 2 celdas no vacías considerables
                 non_empty = sum([1 for c in header if (c and str(c).strip() != '')])
                 if non_empty >= 2 and len(body) >= 1:
                     df_tbl = pd.DataFrame(body, columns=[str(c) if c is not None else f"col_{i}" for i, c in enumerate(header)])
                 else:
                     df_tbl = pd.DataFrame(tbl)
-                # Quitar columnas totalmente vacías
                 if df_tbl.shape[1] > 0:
-                    # Renombrar columnas duplicadas
-                    df_tbl.columns = pd.io.parsers.ParserBase({'names': df_tbl.columns})._maybe_dedup_names(df_tbl.columns)
+                    # ✅ FIX: deduplicación sin usar APIs internas de pandas
+                    df_tbl.columns = _dedup_columns(df_tbl.columns)
                     tables.append(df_tbl)
 
     if not tables:
-        # Si no hubo tablas, devolvemos DF vacío (la app mostrará mensaje)
         return pd.DataFrame()
 
     df = pd.concat(tables, ignore_index=True)
     df = ensure_clean_columns(df)
-
-    # Normalización leve de nombres conocidos por banco (heurística)
-    # Muchos bancos usan columnas como: Fecha / Descripción / Débito / Crédito / Saldo / Importe / Monto, etc.
-    # Acá no forzamos nada, pero podríamos homogeneizar si detectamos patrones claros.
     return df
 
 # ==========================
 # === STREAMLIT UI =========
 # ==========================
 
-st.set_page_config(page_title="Analizador Bancario", layout="wide")
-st.title("📊 Analizador de Conceptos Bancarios (v17 con PDF)")
+st.set_page_config(page_title="Analizador Bancario (v17.1 PDF fix)", layout="wide")
+st.title("📊 Analizador de Conceptos Bancarios (v17.1 con PDF)")
 
 # --- SELECCIÓN DE BANCO ---
 banco = st.selectbox("Seleccioná el banco:", ["Banco Credicoop", "Banco Galicia", "Banco Roela"])
@@ -276,7 +279,6 @@ if uploaded_file:
         debit_aliases = ["debito", "débito", "debitos", "débitos", "monto", "importe", "importe debito", "importe débito", "importe débito/credito", "importe débito/crédito"]
 
         col_concepto_guess = default_concept_col if default_concept_col in df.columns else (guess_column(df, concept_aliases) or df.columns[0])
-        # para el importe, intentamos algunas columnas típicas que aparecen en PDF
         col_debito_guess   = default_debito_col   if default_debito_col   in df.columns else (guess_column(df, debit_aliases)   or df.columns[min(1, len(df.columns)-1)])
 
         st.info(f"Usando columnas: **{col_concepto_guess}** (concepto) / **{col_debito_guess}** (importe). Podés cambiarlas si no coinciden.")
@@ -410,4 +412,4 @@ if uploaded_file:
 
 # --- VERSIÓN DEL SCRIPT ---
 st.markdown("---")
-st.markdown("🛠️ **Versión del script: v17 (PDF habilitado con pdfplumber)**")
+st.markdown("🛠️ **Versión del script: v17.1 (fix pandas ParserBase)**")
