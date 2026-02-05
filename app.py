@@ -40,7 +40,7 @@ def normalize_text(s: str) -> str:
     if pd.isna(s):
         return ""
     s = str(s).strip().lower()
-    s = " ".join(s.split())  # colapsa espacios
+    s = " ".join(s.split())  # colapsa espacios múltiples
     s = ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
     return s
 
@@ -53,33 +53,33 @@ def formato_argentino(valor):
 def parse_amount(x):
     """Parsea importes en formatos variados:
        - "1.234,56", "1234,56", "1,234.56", "1234.56"
-       - "$ 1.234,56", " (1.234,56) "
-       Devuelve float o NaN.
+       - "$ 1.234,56", " (1.234,56) ", "-1.234,56"
+       Devuelve float o NaN sin romper.
     """
     if pd.isna(x):
         return float('nan')
     s = str(x)
-    # usa paréntesis como negativo
-    negative = '(' in s and ')' in s
+    negative = False
 
-    # elimina todo menos dígitos, coma, punto y signo menos
+    # Paréntesis equivalen a negativo contable
+    if '(' in s and ')' in s:
+        negative = True
+
+    # Elimina todo excepto dígitos, coma, punto y signo menos
     s = re.sub(r'[^0-9,.\-]', '', s)
 
-    # si hay coma y punto, asumimos que el punto es miles y la coma es decimal (estilo AR)
+    # Si hay coma y punto, asumimos formato AR/UE: punto miles, coma decimal
     if ',' in s and '.' in s:
         s = s.replace('.', '')  # quita miles
         s = s.replace(',', '.') # decimal punto
 
-    # si solo hay coma, tómala como decimal
+    # Si solo hay coma, tómala como decimal
     elif ',' in s and '.' not in s:
         s = s.replace(',', '.')
 
-    # si solo hay punto, ya es decimal
-    # si no hay separador, es entero
-
     try:
         val = float(s)
-        if negative:
+        if negative and val > 0:
             val = -val
         return val
     except:
@@ -166,7 +166,7 @@ else:  # Banco Roela
     default_debito_col = "Monto"
     invertir_signo = True
 
-st.write(f"Configurado para **{banco}** (columnas objetivo: **{default_concept_col}** / **{default_debito_col}**).")
+st.write(f"Configurado para **{banco}** (columnas objetivo por defecto: **{default_concept_col}** / **{default_debito_col}**).")
 st.write("Subí un Excel/CSV para analizar.")
 
 # Parámetros de carga (por si el CSV no es estándar)
@@ -181,13 +181,20 @@ uploaded_file = st.file_uploader("Elegir archivo", type=["csv", "xlsx", "xls"])
 
 if uploaded_file:
     try:
+        # Lectura
         if uploaded_file.name.lower().endswith(".csv"):
             sep_map = {";": ";", ",": ",", "\\t": "\t"}
-            df = pd.read_csv(uploaded_file, encoding=csv_enc, sep=sep_map[csv_sep])
-            df = ensure_clean_columns(df)
+            df = pd.read_csv(
+                uploaded_file,
+                encoding=csv_enc,
+                sep=sep_map[csv_sep],
+                on_bad_lines='skip'  # evita que un CSV con líneas corruptas rompa toda la carga
+            )
         else:
             df = pd.read_excel(uploaded_file)
-            df = ensure_clean_columns(df)
+
+        # Limpieza homogénea
+        df = ensure_clean_columns(df)
 
         if df.empty or df.columns.size == 0:
             st.error("El archivo está vacío o no tiene columnas reconocibles.")
@@ -199,30 +206,41 @@ if uploaded_file:
         st.dataframe(df.head(1))
 
         # --- DETECCIÓN/SELECCIÓN DE COLUMNAS ---
-        # Intento detectar por alias si las default no están
         concept_aliases = ["concepto", "descripcion", "descripción", "detalle", "concept", "desc"]
         debit_aliases = ["debito", "débito", "debitos", "débitos", "monto", "importe", "importe debito", "importe débito"]
 
-        col_concepto = default_concept_col if default_concept_col in df.columns else (guess_column(df, concept_aliases) or df.columns[0])
-        col_debito   = default_debito_col   if default_debito_col   in df.columns else (guess_column(df, debit_aliases)   or df.columns[1])
+        col_concepto_guess = default_concept_col if default_concept_col in df.columns else (guess_column(df, concept_aliases) or df.columns[0])
+        col_debito_guess   = default_debito_col   if default_debito_col   in df.columns else (guess_column(df, debit_aliases)   or df.columns[min(1, len(df.columns)-1)])
 
-        st.info(f"Usando columnas: **{col_concepto}** (concepto) / **{col_debito}** (importe). Podés cambiarlas si no coinciden.")
+        st.info(f"Usando columnas: **{col_concepto_guess}** (concepto) / **{col_debito_guess}** (importe). Podés cambiarlas si no coinciden.")
         c3, c4 = st.columns(2)
         with c3:
-            col_concepto = st.selectbox("Columna de concepto", options=df.columns, index=list(df.columns).index(col_concepto))
+            col_concepto = st.selectbox("Columna de concepto", options=df.columns, index=list(df.columns).index(col_concepto_guess))
         with c4:
-            col_debito = st.selectbox("Columna de importe (débito)", options=df.columns, index=list(df.columns).index(col_debito))
+            col_debito = st.selectbox("Columna de importe (débito)", options=df.columns, index=list(df.columns).index(col_debito_guess))
 
-        # --- PREPARACIÓN DE CAMPOS NORMALIZADOS ---
+        # --- VALIDACIONES TEMPRANAS ---
+        if col_concepto not in df.columns:
+            st.error(f"La columna de concepto seleccionada (**{col_concepto}**) no existe en el archivo.")
+            st.stop()
+        if col_debito not in df.columns:
+            st.error(f"La columna de importe seleccionada (**{col_debito}**) no existe en el archivo.")
+            st.stop()
+
+        # --- CAMPOS AUXILIARES (garantizados) ---
         df["_concepto_norm"] = df[col_concepto].apply(normalize_text)
         df["_importe_num"] = df[col_debito].apply(parse_amount)
 
-        # Si el banco maneja débitos como negativos, invierto el signo de los negativos para comparabilidad
+        # Ajuste de signo para bancos que traen débitos negativos y esperás verlos como positivos
         if invertir_signo:
             df["_importe_num"] = df["_importe_num"].where(df["_importe_num"] >= 0, -df["_importe_num"])
 
         # Fecha (si existe)
         fecha_col = find_fecha_column(df)
+
+        # Aviso si ningún importe fue parseado correctamente
+        if df["_importe_num"].notna().sum() == 0:
+            st.warning("No se pudo interpretar ningún importe numérico. Revisá el separador decimal (., ,), símbolos o la columna de importes seleccionada.")
 
         # --- CÁLCULO: IMPUESTOS / CONCEPTOS NORMALES ---
         conceptos_norm = [normalize_text(c) for c in CONCEPTOS_A_COMPARAR]
@@ -240,7 +258,7 @@ if uploaded_file:
         total_general = summary["Total Débito"].sum()
         summary = pd.concat([summary, pd.DataFrame([["TOTAL GENERAL", total_general]], columns=["Concepto", "Total Débito"])], ignore_index=True)
 
-        # Guardamos numérico para gráfico antes de formatear
+        # Para gráfico, guardamos numérico antes de formatear
         summary["_Total_Num"] = pd.to_numeric(summary["Total Débito"], errors="coerce").fillna(0.0)
         summary["Total Débito"] = summary["Total Débito"].apply(formato_argentino)
 
@@ -249,7 +267,10 @@ if uploaded_file:
         for grupo, keywords in CONCEPTOS_ESPECIALES.items():
             pattern = conceptos_regex(keywords)
             mask = df["_concepto_norm"].str.contains(pattern, na=False)
-            sub = df.loc[mask, [fecha_col] if fecha_col else [] + [col_concepto, "_importe_num"]].copy()
+
+            cols_especiales = ([fecha_col] if fecha_col else []) + [col_concepto, "_importe_num"]
+            sub = df.loc[mask, cols_especiales].copy()
+
             if not sub.empty:
                 sub["Grupo"] = grupo
                 sub.rename(columns={col_concepto: "Concepto"}, inplace=True)
@@ -258,9 +279,12 @@ if uploaded_file:
                 else:
                     sub["Fecha"] = ""
                 sub["Débito"] = sub["_importe_num"].apply(formato_argentino)
-                detalles_especiales_rows.append(sub[["Fecha", "Concepto", "Débito", "Grupo"]])
+                detalles_especiales_rows.append(sub[["Fecha", "Concepto", "_importe_num", "Débito", "Grupo"]])
 
-        detalles_especiales = pd.concat(detalles_especiales_rows, ignore_index=True) if detalles_especiales_rows else pd.DataFrame(columns=["Fecha", "Concepto", "Débito", "Grupo"])
+        if detalles_especiales_rows:
+            detalles_especiales = pd.concat(detalles_especiales_rows, ignore_index=True)
+        else:
+            detalles_especiales = pd.DataFrame(columns=["Fecha", "Concepto", "_importe_num", "Débito", "Grupo"])
 
         # --- RENDER RESULTADOS ---
         st.markdown("### Resultados generales")
@@ -280,11 +304,7 @@ if uploaded_file:
             for grupo in CONCEPTOS_ESPECIALES.keys():
                 grupo_df = detalles_especiales[detalles_especiales['Grupo'] == grupo]
                 if not grupo_df.empty:
-                    # Calcular subtotal desde el numérico: necesitamos volver a parsear brevemente
-                    subtot = 0.0
-                    # Convertimos los "Débito" formateados de vuelta a float para subtotal
-                    subtot_vals = grupo_df["Débito"].apply(lambda x: float(str(x).replace('.', '').replace(',', '.')))
-                    subtot = float(subtot_vals.sum())
+                    subtot = float(pd.to_numeric(grupo_df["_importe_num"], errors="coerce").sum())
                     with st.expander(f"📌 {grupo} ({len(grupo_df)} registros) - Total: {formato_argentino(subtot)}"):
                         st.dataframe(grupo_df[["Fecha", "Concepto", "Débito"]])
         else:
@@ -293,9 +313,9 @@ if uploaded_file:
         # --- DESCARGA EXCEL ---
         buffer = BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            # Guardar versión numérica y luego formatear para Excel
-            summary.to_excel(writer, index=False, sheet_name="Resumen")
+            summary.drop(columns=["_Total_Num"], errors="ignore").to_excel(writer, index=False, sheet_name="Resumen")
             if not detalles_especiales.empty:
+                # En "Especiales" dejamos también el valor numérico para reuso
                 detalles_especiales.to_excel(writer, index=False, sheet_name="Especiales")
         st.download_button(
             "⬇️ Descargar resultados (Excel)",
@@ -309,4 +329,4 @@ if uploaded_file:
 
 # --- VERSIÓN DEL SCRIPT ---
 st.markdown("---")
-st.markdown("🛠️ **Versión del script: v15**")
+st.markdown("🛠️ **Versión del script: v15.1**")
