@@ -3,6 +3,7 @@ import pandas as pd
 import re
 import unicodedata
 from io import BytesIO
+import pdfplumber  # <-- NUEVO: para extraer tablas desde PDF
 
 # ==========================
 # === CONFIG GENERAL =======
@@ -20,7 +21,6 @@ CONCEPTOS_ESPECIALES = {
     "Maria Luisa": ["maria luisa"],
     "SODAGO": ["sodago"],
     "PAGO AUTOMATICO SERVICIOS": ["pago automatico servicios", "pago automático servicios"],
-    # --- FEDERACIÓN PATRONAL ---
     "FEDERACION PATRO": [
         "federacion patro",
         "federación patro",
@@ -29,7 +29,7 @@ CONCEPTOS_ESPECIALES = {
         "seguro federacion patronal",
         "seguro federación patronal"
     ],
-    # --- SANCOR SOLO CON DOS VARIANTES ---
+    # SANCOR: solo dos variantes (pedido del usuario)
     "SANCOR SEGUROS": [
         "sancor",
         "sancor coop.seg"
@@ -45,7 +45,7 @@ def normalize_text(s: str) -> str:
     if pd.isna(s):
         return ""
     s = str(s).strip().lower()
-    s = " ".join(s.split())  # colapsa espacios múltiples
+    s = " ".join(s.split())
     s = ''.join(c for c in unicodedata.normalize('NFKD', s) if not unicodedata.combining(c))
     return s
 
@@ -56,32 +56,19 @@ def formato_argentino(valor):
         return valor
 
 def parse_amount(x):
-    """Parsea importes en formatos variados:
-       - "1.234,56", "1234,56", "1,234.56", "1234.56"
-       - "$ 1.234,56", " (1.234,56) ", "-1.234,56"
-       Devuelve float o NaN sin romper.
-    """
+    """Parsea importes en formatos variados y devuelve float o NaN."""
     if pd.isna(x):
         return float('nan')
     s = str(x)
     negative = False
-
-    # Paréntesis equivalen a negativo contable
     if '(' in s and ')' in s:
         negative = True
-
-    # Elimina todo excepto dígitos, coma, punto y signo menos
     s = re.sub(r'[^0-9,.\-]', '', s)
-
-    # Si hay coma y punto, asumimos formato AR/UE: punto miles, coma decimal
     if ',' in s and '.' in s:
-        s = s.replace('.', '')  # quita miles
-        s = s.replace(',', '.') # decimal punto
-
-    # Si solo hay coma, tómala como decimal
+        s = s.replace('.', '')
+        s = s.replace(',', '.')
     elif ',' in s and '.' not in s:
         s = s.replace(',', '.')
-
     try:
         val = float(s)
         if negative and val > 0:
@@ -107,27 +94,88 @@ def guess_column(df, candidates):
     return None
 
 def ensure_clean_columns(df):
-    # Limpia nombres de columnas tanto para CSV como Excel
+    # Limpia nombres de columnas tanto para CSV, Excel como PDF parseado
     df.columns = (df.columns
+                  .astype(str)
                   .str.strip()
                   .str.replace(r'\s+', ' ', regex=True))
     # Limpia strings base
     for col in df.select_dtypes(include=['object']).columns:
         df[col] = df[col].astype(str).str.strip()
+    # Quita filas totalmente vacías (a veces aparecen desde PDFs)
+    df = df.dropna(how='all')
     return df
 
 def conceptos_regex(keywords):
-    # arma regex OR sobre keywords normalizados
     import re as _re
     kws = [_re.escape(normalize_text(k)) for k in keywords]
     return r'(' + '|'.join(kws) + r')'
+
+# ==========================
+# === PDF PARSER ===========
+# ==========================
+
+def parse_pdf_to_dataframe(uploaded_pdf, banco: str) -> pd.DataFrame:
+    """
+    Extrae tablas de un PDF usando pdfplumber.
+    Devuelve un DataFrame concatenado y limpio.
+    Notas:
+      - Si hay múltiples tablas por página, las concatena.
+      - Intenta usar la primera fila de cada tabla como encabezado si parece header.
+      - Filtra columnas vacías/duplicadas.
+    """
+    tables = []
+    with pdfplumber.open(uploaded_pdf) as pdf:
+        for page in pdf.pages:
+            # table_settings ayudan con líneas débiles o celdas sin bordes
+            extracted = page.extract_tables(table_settings={
+                "vertical_strategy": "lines",
+                "horizontal_strategy": "lines",
+                "intersection_tolerance": 5,
+                "snap_tolerance": 3,
+                "join_tolerance": 3,
+                "edge_min_length": 10,
+            })
+            # Si no detecta líneas, probamos la heurística "text-based"
+            if not extracted or len(extracted) == 0:
+                extracted = page.extract_tables()  # fallback default
+
+            for tbl in extracted or []:
+                if not tbl or len(tbl) == 0:
+                    continue
+                # Heurística: si la primera fila parece encabezado (más “texto” que números), úsala como header
+                header = tbl[0]
+                body = tbl[1:] if len(tbl) > 1 else []
+                # Si header tiene al menos 2 celdas no vacías considerables
+                non_empty = sum([1 for c in header if (c and str(c).strip() != '')])
+                if non_empty >= 2 and len(body) >= 1:
+                    df_tbl = pd.DataFrame(body, columns=[str(c) if c is not None else f"col_{i}" for i, c in enumerate(header)])
+                else:
+                    df_tbl = pd.DataFrame(tbl)
+                # Quitar columnas totalmente vacías
+                if df_tbl.shape[1] > 0:
+                    # Renombrar columnas duplicadas
+                    df_tbl.columns = pd.io.parsers.ParserBase({'names': df_tbl.columns})._maybe_dedup_names(df_tbl.columns)
+                    tables.append(df_tbl)
+
+    if not tables:
+        # Si no hubo tablas, devolvemos DF vacío (la app mostrará mensaje)
+        return pd.DataFrame()
+
+    df = pd.concat(tables, ignore_index=True)
+    df = ensure_clean_columns(df)
+
+    # Normalización leve de nombres conocidos por banco (heurística)
+    # Muchos bancos usan columnas como: Fecha / Descripción / Débito / Crédito / Saldo / Importe / Monto, etc.
+    # Acá no forzamos nada, pero podríamos homogeneizar si detectamos patrones claros.
+    return df
 
 # ==========================
 # === STREAMLIT UI =========
 # ==========================
 
 st.set_page_config(page_title="Analizador Bancario", layout="wide")
-st.title("📊 Analizador de Conceptos Bancarios")
+st.title("📊 Analizador de Conceptos Bancarios (v17 con PDF)")
 
 # --- SELECCIÓN DE BANCO ---
 banco = st.selectbox("Seleccioná el banco:", ["Banco Credicoop", "Banco Galicia", "Banco Roela"])
@@ -173,9 +221,9 @@ else:  # Banco Roela
     invertir_signo = True
 
 st.write(f"Configurado para **{banco}** (columnas objetivo por defecto: **{default_concept_col}** / **{default_debito_col}**).")
-st.write("Subí un Excel/CSV para analizar.")
+st.write("Subí un Excel/CSV/PDF para analizar.")
 
-# Parámetros de carga (por si el CSV no es estándar)
+# Parámetros de carga CSV
 c1, c2 = st.columns(2)
 with c1:
     csv_sep = st.selectbox("Separador CSV", [";", ",", "\\t"], index=0, help="Solo afecta si subís CSV")
@@ -183,24 +231,36 @@ with c2:
     csv_enc = st.selectbox("Encoding CSV", ["latin1", "utf-8", "cp1252"], index=0, help="Solo afecta si subís CSV")
 
 # --- CARGA DE ARCHIVO ---
-uploaded_file = st.file_uploader("Elegir archivo", type=["csv", "xlsx", "xls"])
+uploaded_file = st.file_uploader("Elegir archivo", type=["csv", "xlsx", "xls", "pdf"])
 
 if uploaded_file:
     try:
-        # Lectura
-        if uploaded_file.name.lower().endswith(".csv"):
+        file_name = uploaded_file.name.lower()
+
+        # Lectura según extensión
+        if file_name.endswith(".csv"):
             sep_map = {";": ";", ",": ",", "\\t": "\t"}
             df = pd.read_csv(
                 uploaded_file,
                 encoding=csv_enc,
                 sep=sep_map[csv_sep],
-                on_bad_lines='skip'  # evita que un CSV con líneas corruptas rompa toda la carga
+                on_bad_lines='skip'
             )
-        else:
-            df = pd.read_excel(uploaded_file)
+            df = ensure_clean_columns(df)
 
-        # Limpieza homogénea
-        df = ensure_clean_columns(df)
+        elif file_name.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(uploaded_file)
+            df = ensure_clean_columns(df)
+
+        elif file_name.endswith(".pdf"):
+            st.info("Procesando PDF… Esto puede tardar unos segundos según el tamaño del archivo.")
+            df = parse_pdf_to_dataframe(uploaded_file, banco=banco)
+            if df.empty or df.columns.size == 0:
+                st.error("No se pudieron detectar tablas utilizables en el PDF. Si el PDF es escaneado (imagen), necesitaremos OCR (p. ej., Tesseract).")
+                st.stop()
+        else:
+            st.error("Formato no soportado.")
+            st.stop()
 
         if df.empty or df.columns.size == 0:
             st.error("El archivo está vacío o no tiene columnas reconocibles.")
@@ -213,9 +273,10 @@ if uploaded_file:
 
         # --- DETECCIÓN/SELECCIÓN DE COLUMNAS ---
         concept_aliases = ["concepto", "descripcion", "descripción", "detalle", "concept", "desc"]
-        debit_aliases = ["debito", "débito", "debitos", "débitos", "monto", "importe", "importe debito", "importe débito"]
+        debit_aliases = ["debito", "débito", "debitos", "débitos", "monto", "importe", "importe debito", "importe débito", "importe débito/credito", "importe débito/crédito"]
 
         col_concepto_guess = default_concept_col if default_concept_col in df.columns else (guess_column(df, concept_aliases) or df.columns[0])
+        # para el importe, intentamos algunas columnas típicas que aparecen en PDF
         col_debito_guess   = default_debito_col   if default_debito_col   in df.columns else (guess_column(df, debit_aliases)   or df.columns[min(1, len(df.columns)-1)])
 
         st.info(f"Usando columnas: **{col_concepto_guess}** (concepto) / **{col_debito_guess}** (importe). Podés cambiarlas si no coinciden.")
@@ -237,7 +298,7 @@ if uploaded_file:
         df["_concepto_norm"] = df[col_concepto].apply(normalize_text)
         df["_importe_num"] = df[col_debito].apply(parse_amount)
 
-        # Ajuste de signo para bancos que traen débitos negativos y esperás verlos como positivos
+        # Ajuste de signo para bancos que traen débitos negativos y querés verlos como positivos
         if invertir_signo:
             df["_importe_num"] = df["_importe_num"].where(df["_importe_num"] >= 0, -df["_importe_num"])
 
@@ -246,7 +307,6 @@ if uploaded_file:
 
         # --- Filtro por fecha opcional ---
         if fecha_col:
-            # Intentamos parsear fechas (dd/mm/yyyy común en AR)
             df["_fecha_parse"] = pd.to_datetime(df[fecha_col], errors="coerce", dayfirst=True, infer_datetime_format=True)
             min_f = pd.to_datetime(df["_fecha_parse"].min())
             max_f = pd.to_datetime(df["_fecha_parse"].max())
@@ -257,15 +317,13 @@ if uploaded_file:
                     desde = st.date_input("Desde", value=min_f.date())
                 with f2:
                     hasta = st.date_input("Hasta", value=max_f.date())
-                # Aplicamos filtro
                 mask_fecha = (df["_fecha_parse"].dt.date >= desde) & (df["_fecha_parse"].dt.date <= hasta)
                 df = df.loc[mask_fecha].copy()
             else:
                 st.info("Columna de fecha detectada pero no se pudo parsear. Se omite el filtro por fecha.")
 
-        # Aviso si ningún importe fue parseado correctamente
         if df["_importe_num"].notna().sum() == 0:
-            st.warning("No se pudo interpretar ningún importe numérico. Revisá el separador decimal (., ,), símbolos o la columna de importes seleccionada.")
+            st.warning("No se pudo interpretar ningún importe numérico. Revisá la columna de importes o el formato en el PDF.")
 
         # --- CÁLCULO: IMPUESTOS / CONCEPTOS NORMALES ---
         conceptos_norm = [normalize_text(c) for c in CONCEPTOS_A_COMPARAR]
@@ -283,7 +341,6 @@ if uploaded_file:
         total_general = summary["Total Débito"].sum()
         summary = pd.concat([summary, pd.DataFrame([["TOTAL GENERAL", total_general]], columns=["Concepto", "Total Débito"])], ignore_index=True)
 
-        # Para gráfico, guardamos numérico antes de formatear
         summary["_Total_Num"] = pd.to_numeric(summary["Total Débito"], errors="coerce").fillna(0.0)
         summary["Total Débito"] = summary["Total Débito"].apply(formato_argentino)
 
@@ -294,7 +351,6 @@ if uploaded_file:
             mask = df["_concepto_norm"].str.contains(pattern, na=False)
 
             cols_especiales = ([fecha_col] if fecha_col else []) + [col_concepto, "_importe_num"]
-            # Evitar incluir una columna de fecha inválida
             cols_especiales = [c for c in cols_especiales if c in df.columns]
             sub = df.loc[mask, cols_especiales].copy()
 
@@ -320,7 +376,6 @@ if uploaded_file:
         st.markdown("### Resumen por concepto")
         st.dataframe(summary[["Concepto", "Total Débito"]])
 
-        # Gráfico (sin la fila TOTAL GENERAL)
         base_chart = summary[summary["Concepto"] != "TOTAL GENERAL"].set_index("Concepto")["_Total_Num"]
         if len(base_chart) > 0:
             st.markdown("#### Visualización rápida")
@@ -342,7 +397,6 @@ if uploaded_file:
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
             summary.drop(columns=["_Total_Num"], errors="ignore").to_excel(writer, index=False, sheet_name="Resumen")
             if not detalles_especiales.empty:
-                # En "Especiales" dejamos también el valor numérico para reuso
                 detalles_especiales.to_excel(writer, index=False, sheet_name="Especiales")
         st.download_button(
             "⬇️ Descargar resultados (Excel)",
@@ -356,4 +410,4 @@ if uploaded_file:
 
 # --- VERSIÓN DEL SCRIPT ---
 st.markdown("---")
-st.markdown("🛠️ **Versión del script: v16**")
+st.markdown("🛠️ **Versión del script: v17 (PDF habilitado con pdfplumber)**")
