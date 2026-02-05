@@ -20,7 +20,7 @@ CONCEPTOS_ESPECIALES = {
     "Maria Luisa": ["maria luisa"],
     "SODAGO": ["sodago"],
     "PAGO AUTOMATICO SERVICIOS": ["pago automatico servicios", "pago automático servicios"],
-    # --- NUEVO CONCEPTO ESPECIAL ---
+    # --- FEDERACIÓN PATRONAL ---
     "FEDERACION PATRO": [
         "federacion patro",
         "federación patro",
@@ -28,6 +28,11 @@ CONCEPTOS_ESPECIALES = {
         "federación patronal",
         "seguro federacion patronal",
         "seguro federación patronal"
+    ],
+    # --- SANCOR SOLO CON DOS VARIANTES ---
+    "SANCOR SEGUROS": [
+        "sancor",
+        "sancor coop.seg"
     ]
 }
 
@@ -113,7 +118,8 @@ def ensure_clean_columns(df):
 
 def conceptos_regex(keywords):
     # arma regex OR sobre keywords normalizados
-    kws = [re.escape(normalize_text(k)) for k in keywords]
+    import re as _re
+    kws = [_re.escape(normalize_text(k)) for k in keywords]
     return r'(' + '|'.join(kws) + r')'
 
 # ==========================
@@ -238,6 +244,25 @@ if uploaded_file:
         # Fecha (si existe)
         fecha_col = find_fecha_column(df)
 
+        # --- Filtro por fecha opcional ---
+        if fecha_col:
+            # Intentamos parsear fechas (dd/mm/yyyy común en AR)
+            df["_fecha_parse"] = pd.to_datetime(df[fecha_col], errors="coerce", dayfirst=True, infer_datetime_format=True)
+            min_f = pd.to_datetime(df["_fecha_parse"].min())
+            max_f = pd.to_datetime(df["_fecha_parse"].max())
+            if pd.notna(min_f) and pd.notna(max_f):
+                st.markdown("#### Filtro por fecha")
+                f1, f2 = st.columns(2)
+                with f1:
+                    desde = st.date_input("Desde", value=min_f.date())
+                with f2:
+                    hasta = st.date_input("Hasta", value=max_f.date())
+                # Aplicamos filtro
+                mask_fecha = (df["_fecha_parse"].dt.date >= desde) & (df["_fecha_parse"].dt.date <= hasta)
+                df = df.loc[mask_fecha].copy()
+            else:
+                st.info("Columna de fecha detectada pero no se pudo parsear. Se omite el filtro por fecha.")
+
         # Aviso si ningún importe fue parseado correctamente
         if df["_importe_num"].notna().sum() == 0:
             st.warning("No se pudo interpretar ningún importe numérico. Revisá el separador decimal (., ,), símbolos o la columna de importes seleccionada.")
@@ -269,12 +294,14 @@ if uploaded_file:
             mask = df["_concepto_norm"].str.contains(pattern, na=False)
 
             cols_especiales = ([fecha_col] if fecha_col else []) + [col_concepto, "_importe_num"]
+            # Evitar incluir una columna de fecha inválida
+            cols_especiales = [c for c in cols_especiales if c in df.columns]
             sub = df.loc[mask, cols_especiales].copy()
 
             if not sub.empty:
                 sub["Grupo"] = grupo
                 sub.rename(columns={col_concepto: "Concepto"}, inplace=True)
-                if fecha_col:
+                if fecha_col and fecha_col in sub.columns:
                     sub.rename(columns={fecha_col: "Fecha"}, inplace=True)
                 else:
                     sub["Fecha"] = ""
@@ -329,4 +356,4 @@ if uploaded_file:
 
 # --- VERSIÓN DEL SCRIPT ---
 st.markdown("---")
-st.markdown("🛠️ **Versión del script: v15.1**")
+st.markdown("🛠️ **Versión del script: v16**")
