@@ -3,7 +3,7 @@ import pandas as pd
 import re
 import unicodedata
 from io import BytesIO
-import pdfplumber  # para extraer tablas desde PDF
+import pdfplumber  # PDF parser
 
 # ==========================
 # === CONFIG GENERAL =======
@@ -29,7 +29,7 @@ CONCEPTOS_ESPECIALES = {
         "seguro federacion patronal",
         "seguro federación patronal"
     ],
-    # SANCOR: solo dos variantes (pedido del usuario)
+    # SANCOR: solo dos variantes (según tu pedido)
     "SANCOR SEGUROS": [
         "sancor",
         "sancor coop.seg"
@@ -41,7 +41,7 @@ CONCEPTOS_ESPECIALES = {
 # ==========================
 
 def normalize_text(s: str) -> str:
-    """Minúsculas, sin acentos, sin doble espacio, strip."""
+    """Minus, sin acentos, espacios colapsados, strip."""
     if pd.isna(s):
         return ""
     s = str(s).strip().lower()
@@ -85,7 +85,7 @@ def find_fecha_column(df):
     return None
 
 def guess_column(df, candidates):
-    """Intenta encontrar una columna que contenga cualquiera de los alias en candidates."""
+    """Busca una columna conteniendo alguno de los alias indicados."""
     cols_norm = {col: normalize_text(col) for col in df.columns}
     for alias in candidates:
         for col, cn in cols_norm.items():
@@ -94,30 +94,23 @@ def guess_column(df, candidates):
     return None
 
 def ensure_clean_columns(df):
-    # Limpia nombres de columnas tanto para CSV, Excel como PDF parseado
+    # Limpia nombres y valores tipo texto
     df.columns = (pd.Index(df.columns)
                     .astype(str)
                     .str.strip()
                     .str.replace(r'\s+', ' ', regex=True))
-    # Limpia strings base
     for col in df.select_dtypes(include=['object']).columns:
         df[col] = df[col].astype(str).str.strip()
-    # Quita filas totalmente vacías (a veces aparecen desde PDFs)
     df = df.dropna(how='all')
     return df
 
 def conceptos_regex(keywords):
-    import re as _re
-    kws = [_re.escape(normalize_text(k)) for k in keywords]
+    kws = [re.escape(normalize_text(k)) for k in keywords]
     return r'(' + '|'.join(kws) + r')'
 
 def _dedup_columns(cols):
-    """
-    Deduplica nombres de columnas preservando orden.
-    Ej.: ["Fecha", "Fecha", "Monto"] -> ["Fecha", "Fecha.1", "Monto"]
-    """
-    out = []
-    seen = {}
+    """Dedup de nombres preservando orden: Fecha, Fecha -> Fecha, Fecha.1"""
+    out, seen = [], {}
     for c in cols:
         name = str(c) if c is not None else ""
         if name not in seen:
@@ -129,56 +122,267 @@ def _dedup_columns(cols):
     return out
 
 # ==========================
-# === PDF PARSER ===========
+# === PDF PARSER UNIVERSAL ==
 # ==========================
+
+_DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+_NUM_RE  = re.compile(r"^[\(\)\-\s\$]*\d{1,3}(\.\d{3})*(,\d+)?$|^[\(\)\-\s\$]*\d+(\.\d+)?$")
+
+HEADER_ALIASES = {
+    "fecha": ["fecha", "date", "fec"],
+    "concepto": ["concepto", "descripcion", "descripción", "detalle", "concept", "desc"],
+    "nro": ["nro", "nro.cpbte", "nro cpbte", "comprobante", "nro.comprobante", "nº", "numero", "número", "doc", "ref"],
+    "debito": ["debito", "débito", "debe", "deb.", "déb."],
+    "credito": ["credito", "crédito", "haber", "cred.", "créd."],
+    "saldo": ["saldo", "balance", "disponible", "contable"],
+    "cod": ["cod", "cód", "codigo", "código"]
+}
+
+STANDARD_NAMES = ["Fecha", "Concepto", "Nro.Cpbte.", "Débito", "Crédito", "Saldo", "Cód."]
+
+def _best_name(colname_norm):
+    """Mapea un encabezado crudo a un nombre estándar, si calza."""
+    for std, aliases in HEADER_ALIASES.items():
+        if any(a in colname_norm for a in aliases):
+            if std == "nro": return "Nro.Cpbte."
+            if std == "debito": return "Débito"
+            if std == "credito": return "Crédito"
+            if std == "cod": return "Cód."
+            return std.capitalize()
+    return None
+
+def _map_headers(cols):
+    """Intenta mapear columnas crudas a nombres estándar; conserva las que no mapean."""
+    mapped = []
+    used = set()
+    for c in cols:
+        name = str(c)
+        m = _best_name(normalize_text(name))
+        if m and m not in used:
+            mapped.append(m)
+            used.add(m)
+        else:
+            mapped.append(name)  # dejamos como está
+    return mapped
+
+def _extract_tables_all_strategies(pdf):
+    """Devuelve lista de tablas crudas (listas de filas) probando varias estrategias."""
+    tables = []
+    STRATS = [
+        dict(vertical_strategy="lines", horizontal_strategy="lines",
+             intersection_tolerance=5, snap_tolerance=3, join_tolerance=3, edge_min_length=10),
+        dict(vertical_strategy="lines", horizontal_strategy="text"),
+        dict(vertical_strategy="text",  horizontal_strategy="text"),
+    ]
+    for page in pdf.pages:
+        page_tables = []
+        for ts in STRATS:
+            try:
+                t = page.extract_tables(table_settings=ts)
+                if t:
+                    page_tables.extend(t)
+            except Exception:
+                continue
+        # fallback simple (sin settings)
+        if not page_tables:
+            try:
+                t = page.extract_tables()
+                if t:
+                    page_tables.extend(t)
+            except Exception:
+                pass
+        tables.extend(page_tables)
+    return tables
+
+def _tables_to_df(tables):
+    """Convierte tablas crudas en un DF unificado, intentando detectar encabezados."""
+    dfs = []
+    for tbl in tables or []:
+        if not tbl or len(tbl) == 0:
+            continue
+        # Heurística de encabezado: si la primera fila tiene >2 celdas no vacías y hay filas debajo
+        header, body = tbl[0], tbl[1:] if len(tbl) > 1 else (tbl[0], [])
+        non_empty = sum(1 for c in header if c and str(c).strip())
+        # Si parece encabezado y hay cuerpo
+        if non_empty >= 2 and len(body) >= 1:
+            cols = [str(c) if c is not None else f"col_{i}" for i, c in enumerate(header)]
+            df_tbl = pd.DataFrame(body, columns=cols)
+        else:
+            df_tbl = pd.DataFrame(tbl)
+        if df_tbl.shape[1] == 0:
+            continue
+        df_tbl.columns = _dedup_columns(df_tbl.columns)
+        # Intentar mapear encabezados a estándar
+        df_tbl.columns = _map_headers(df_tbl.columns)
+        dfs.append(df_tbl)
+    if not dfs:
+        return pd.DataFrame()
+    # Unificamos por columnas (outer join-like, pero más simple: concatenamos y rellenamos faltantes)
+    df = pd.concat(dfs, ignore_index=True, sort=False)
+    return ensure_clean_columns(df)
+
+def _words_to_records(pdf):
+    """
+    Reconstruye filas por texto:
+    - detecta inicio de fila por fecha dd/mm/yyyy
+    - toma los ÚLTIMOS 3 números como Débito, Crédito, Saldo
+    - el resto intermedio es Concepto; se intenta tomar Nro.Cpbte. si hay un num. 'aislado' justo antes de importes
+    """
+    records = []
+
+    def group_lines(words, y_tol=3.0):
+        # agrupa por hilera usando 'top' aproximado
+        lines = []
+        words_sorted = sorted(words, key=lambda w: (round(float(w["top"]), 1), float(w["x0"])))
+        current_y = None
+        current = []
+        for w in words_sorted:
+            y = float(w["top"])
+            if current_y is None or abs(y - current_y) <= y_tol:
+                current.append(w)
+                current_y = y if current_y is None else (current_y + y) / 2.0
+            else:
+                lines.append(current)
+                current = [w]
+                current_y = y
+        if current:
+            lines.append(current)
+        # devuelve lista de líneas: cada línea es lista de palabras ordenadas por x
+        return [[ww["text"] for ww in sorted(line, key=lambda x: float(x["x0"]))] for line in lines]
+
+    for page in pdf.pages:
+        try:
+            words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
+        except Exception:
+            words = []
+        if not words:
+            continue
+        lines = group_lines(words)
+        # stream de tokens: línea a línea
+        tokens = []
+        for ln in lines:
+            # unimos por espacios, pero mantenemos tokens separados
+            tokens.extend(ln + ["<LB>"])  # marcador de salto de línea
+
+        # cortar registros por fecha
+        i, L = 0, len(tokens)
+        while i < L:
+            if isinstance(tokens[i], str) and _DATE_RE.match(tokens[i]):
+                chunk = [tokens[i]]
+                i += 1
+                while i < L and not (_DATE_RE.match(tokens[i]) if isinstance(tokens[i], str) else False):
+                    chunk.append(tokens[i])
+                    i += 1
+                # parsear chunk -> registro
+                rec = _parse_chunk_to_record(chunk)
+                if rec:
+                    records.append(rec)
+            else:
+                i += 1
+
+    if not records:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(records, columns=["Fecha", "Concepto", "Nro.Cpbte.", "Débito", "Crédito", "Saldo", "Cód."])
+    return ensure_clean_columns(df)
+
+def _parse_chunk_to_record(chunk):
+    """
+    chunk: [ 'dd/mm/yyyy', ..., '<LB>' ... ]
+    Heurística:
+      - Fecha = primer token
+      - Buscar desde el final 3 NUMÉRICOS -> (Débito, Crédito, Saldo) en ese orden (si no, intentar permutar)
+      - Intentar Nro.Cpbte. como el numérico inmediatamente anterior a los importes (si luce 'id' corto)
+      - Concepto = todo entre Fecha y ese Nro/primer importe
+      - Cód. = vacío (suele no venir estable en texto plano)
+    """
+    # limpiar '<LB>'
+    chunk = [t for t in chunk if t != "<LB>"]
+    if not chunk or not _DATE_RE.match(chunk[0]):
+        return None
+
+    fecha = chunk[0]
+    body = chunk[1:]
+
+    # tomar los últimos 5 tokens como candidatos a importes/cpbte/cod
+    # y expandir si hace falta
+    # estrategia: escanear desde el final, recolectar NUM hasta obtener 3
+    idx = len(body) - 1
+    nums = []
+    idxs = []
+    while idx >= 0 and len(nums) < 3:
+        t = body[idx]
+        if _NUM_RE.match(t):
+            nums.append(t)
+            idxs.append(idx)
+        idx -= 1
+    if len(nums) < 2:
+        return None  # no parece un movimiento completo
+
+    # Los importes encontrados están al revés
+    nums_rev = list(reversed(nums))
+    idxs_rev = list(reversed(idxs))
+
+    # Asignación conservadora:
+    # - Si hay 3: Débito, Crédito, Saldo = nums_rev[0], nums_rev[1], nums_rev[2]
+    # - Si hay 2: asumimos Crédito, Saldo (o Débito, Saldo); dejamos el faltante en "0"
+    deb, cred, saldo = "0", "0", "0"
+    if len(nums_rev) == 3:
+        deb, cred, saldo = nums_rev[0], nums_rev[1], nums_rev[2]
+        first_amount_ix = idxs_rev[0]
+    else:
+        # 2 números: damos prioridad a "Saldo" como el último
+        saldo = nums_rev[-1]
+        first_amount_ix = idxs_rev[0]
+        # el restante lo consideramos Crédito
+        cred = nums_rev[0]
+
+    # Intento de Nro.Cpbte.: token inmediatamente antes del primer importe, si es un número "de id"
+    nro = ""
+    candidate_ix = first_amount_ix - 1
+    if candidate_ix >= 0 and re.fullmatch(r"[A-Za-z0-9\-\.]{3,12}", body[candidate_ix]):
+        nro = body[candidate_ix]
+        concept_tokens = body[:candidate_ix]
+    else:
+        concept_tokens = body[:first_amount_ix]
+
+    concepto = " ".join([t for t in concept_tokens if t])
+
+    return [fecha, concepto, nro, deb, cred, saldo, ""]
 
 def parse_pdf_to_dataframe(uploaded_pdf, banco: str) -> pd.DataFrame:
     """
-    Extrae tablas de un PDF usando pdfplumber.
-    Devuelve un DataFrame concatenado y limpio.
+    Parser PDF universal:
+      1) intenta tablas con varias estrategias
+      2) si falla o no hay columnas útiles, reconstruye por texto (words)
     """
-    tables = []
     with pdfplumber.open(uploaded_pdf) as pdf:
-        for page in pdf.pages:
-            extracted = page.extract_tables(table_settings={
-                "vertical_strategy": "lines",
-                "horizontal_strategy": "lines",
-                "intersection_tolerance": 5,
-                "snap_tolerance": 3,
-                "join_tolerance": 3,
-                "edge_min_length": 10,
-            })
-            if not extracted or len(extracted) == 0:
-                extracted = page.extract_tables()  # fallback
+        # 1) Tablas
+        tables = _extract_tables_all_strategies(pdf)
+        df_tables = _tables_to_df(tables)
+        usable = (not df_tables.empty) and (df_tables.shape[0] > 0)
 
-            for tbl in extracted or []:
-                if not tbl or len(tbl) == 0:
-                    continue
-                header = tbl[0]
-                body = tbl[1:] if len(tbl) > 1 else []
-                non_empty = sum([1 for c in header if (c and str(c).strip() != '')])
-                if non_empty >= 2 and len(body) >= 1:
-                    df_tbl = pd.DataFrame(body, columns=[str(c) if c is not None else f"col_{i}" for i, c in enumerate(header)])
-                else:
-                    df_tbl = pd.DataFrame(tbl)
-                if df_tbl.shape[1] > 0:
-                    # ✅ FIX: deduplicación sin usar APIs internas de pandas
-                    df_tbl.columns = _dedup_columns(df_tbl.columns)
-                    tables.append(df_tbl)
+        # ¿tenemos algo parecido a columnas clave?
+        has_any_core = any(_best_name(normalize_text(c)) in ["Fecha", "Concepto", "Débito", "Crédito", "Saldo", "Nro.Cpbte.", "Cód."]
+                           for c in df_tables.columns) if usable else False
 
-    if not tables:
-        return pd.DataFrame()
+        if usable and has_any_core:
+            return df_tables
 
-    df = pd.concat(tables, ignore_index=True)
-    df = ensure_clean_columns(df)
-    return df
+        # 2) Reconstrucción por words
+        df_words = _words_to_records(pdf)
+        if not df_words.empty:
+            return df_words
+
+    # si nada funcionó:
+    return pd.DataFrame()
 
 # ==========================
 # === STREAMLIT UI =========
 # ==========================
 
-st.set_page_config(page_title="Analizador Bancario (v17.1 PDF fix)", layout="wide")
-st.title("📊 Analizador de Conceptos Bancarios (v17.1 con PDF)")
+st.set_page_config(page_title="Analizador Bancario (v18 PDF universal)", layout="wide")
+st.title("📊 Analizador de Conceptos Bancarios (v18, PDF universal)")
 
 # --- SELECCIÓN DE BANCO ---
 banco = st.selectbox("Seleccioná el banco:", ["Banco Credicoop", "Banco Galicia", "Banco Roela"])
@@ -256,10 +460,10 @@ if uploaded_file:
             df = ensure_clean_columns(df)
 
         elif file_name.endswith(".pdf"):
-            st.info("Procesando PDF… Esto puede tardar unos segundos según el tamaño del archivo.")
+            st.info("Procesando PDF… puede tardar unos segundos.")
             df = parse_pdf_to_dataframe(uploaded_file, banco=banco)
             if df.empty or df.columns.size == 0:
-                st.error("No se pudieron detectar tablas utilizables en el PDF. Si el PDF es escaneado (imagen), necesitaremos OCR (p. ej., Tesseract).")
+                st.error("No se pudieron detectar tablas o líneas útiles en el PDF. Si el PDF es escaneado (imagen), se requiere OCR.")
                 st.stop()
         else:
             st.error("Formato no soportado.")
@@ -276,8 +480,8 @@ if uploaded_file:
 
         # --- DETECCIÓN/SELECCIÓN DE COLUMNAS ---
         concept_aliases = ["concepto", "descripcion", "descripción", "detalle", "concept", "desc"]
-        debit_aliases = ["debito", "débito", "debitos", "débitos", "monto", "importe", "importe debito", "importe débito", "importe débito/credito", "importe débito/crédito"]
-
+        debit_aliases   = ["debito", "débito", "debitos", "débitos", "monto", "importe", "importe debito", "importe débito", "debe"]
+        # Defaults si existen; si no, adivinamos por alias
         col_concepto_guess = default_concept_col if default_concept_col in df.columns else (guess_column(df, concept_aliases) or df.columns[0])
         col_debito_guess   = default_debito_col   if default_debito_col   in df.columns else (guess_column(df, debit_aliases)   or df.columns[min(1, len(df.columns)-1)])
 
@@ -310,8 +514,7 @@ if uploaded_file:
         # --- Filtro por fecha opcional ---
         if fecha_col:
             df["_fecha_parse"] = pd.to_datetime(df[fecha_col], errors="coerce", dayfirst=True, infer_datetime_format=True)
-            min_f = pd.to_datetime(df["_fecha_parse"].min())
-            max_f = pd.to_datetime(df["_fecha_parse"].max())
+            min_f, max_f = pd.to_datetime(df["_fecha_parse"].min()), pd.to_datetime(df["_fecha_parse"].max())
             if pd.notna(min_f) and pd.notna(max_f):
                 st.markdown("#### Filtro por fecha")
                 f1, f2 = st.columns(2)
@@ -325,7 +528,7 @@ if uploaded_file:
                 st.info("Columna de fecha detectada pero no se pudo parsear. Se omite el filtro por fecha.")
 
         if df["_importe_num"].notna().sum() == 0:
-            st.warning("No se pudo interpretar ningún importe numérico. Revisá la columna de importes o el formato en el PDF.")
+            st.warning("No se pudo interpretar ningún importe numérico. Revisá la columna de importes o el formato del archivo.")
 
         # --- CÁLCULO: IMPUESTOS / CONCEPTOS NORMALES ---
         conceptos_norm = [normalize_text(c) for c in CONCEPTOS_A_COMPARAR]
@@ -342,8 +545,6 @@ if uploaded_file:
         summary = pd.DataFrame(resumen_items, columns=["Concepto", "Total Débito"])
         total_general = summary["Total Débito"].sum()
         summary = pd.concat([summary, pd.DataFrame([["TOTAL GENERAL", total_general]], columns=["Concepto", "Total Débito"])], ignore_index=True)
-
-        summary["_Total_Num"] = pd.to_numeric(summary["Total Débito"], errors="coerce").fillna(0.0)
         summary["Total Débito"] = summary["Total Débito"].apply(formato_argentino)
 
         # --- CONCEPTOS ESPECIALES ---
@@ -371,17 +572,12 @@ if uploaded_file:
         else:
             detalles_especiales = pd.DataFrame(columns=["Fecha", "Concepto", "_importe_num", "Débito", "Grupo"])
 
-        # --- RENDER RESULTADOS ---
+        # --- RENDER RESULTADOS (sin gráfico) ---
         st.markdown("### Resultados generales")
         st.write(f"**Suma total de impuestos (conceptos normales):** {formato_argentino(total_impuestos)}")
 
         st.markdown("### Resumen por concepto")
         st.dataframe(summary[["Concepto", "Total Débito"]])
-
-        base_chart = summary[summary["Concepto"] != "TOTAL GENERAL"].set_index("Concepto")["_Total_Num"]
-        if len(base_chart) > 0:
-            st.markdown("#### Visualización rápida")
-            st.bar_chart(base_chart)
 
         if not detalles_especiales.empty:
             st.markdown("### Detalle de conceptos especiales")
@@ -397,7 +593,7 @@ if uploaded_file:
         # --- DESCARGA EXCEL ---
         buffer = BytesIO()
         with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-            summary.drop(columns=["_Total_Num"], errors="ignore").to_excel(writer, index=False, sheet_name="Resumen")
+            summary.to_excel(writer, index=False, sheet_name="Resumen")
             if not detalles_especiales.empty:
                 detalles_especiales.to_excel(writer, index=False, sheet_name="Especiales")
         st.download_button(
@@ -412,4 +608,4 @@ if uploaded_file:
 
 # --- VERSIÓN DEL SCRIPT ---
 st.markdown("---")
-st.markdown("🛠️ **Versión del script: v17.1 (fix pandas ParserBase)**")
+st.markdown("🛠️ **Versión del script: v18 (PDF universal, sin gráfico)**")
