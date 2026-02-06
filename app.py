@@ -109,16 +109,19 @@ def conceptos_regex(keywords):
     return r'(' + '|'.join(kws) + r')'
 
 # ==========================
-# === PDF PARSER (v19) =====
+# === PDF PARSER (v19.2) ===
 # ==========================
 
 # Patrones generales
 DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
-NUM_RE  = re.compile(r"^[\(\)\-\s\$]*\d{1,3}(\.\d{3})*(,\d+)?$|^[\(\)\-\s\$]*\d+(\.\d+)?$")
+NUM_RE  = re.compile(r"^[\(\)\-\s\$]*\d{1,3}(\.\d{3})*(,\d+)?$|^[\(\)\-\s\$]*\d+(\.\d+)?$")  # números/monedas
+PURE_INT_RE = re.compile(r"^\d{1,12}$")  # id simple (sin coma/punto)
+CODE_ALPHA_NUM_RE = re.compile(r"^[A-Z0-9]{3,8}$")  # códigos tipo IDCC1 / IVA05
+CODE_NUM_4_6_RE = re.compile(r"^\d{4,6}$")          # códigos numéricos cortos, p.ej. 01872
 
 STANDARD_NAMES = ["Fecha", "Concepto", "Nro.Cpbte.", "Débito", "Crédito", "Saldo", "Cód."]
 
-# Algunas palabras que suelen aparecer en conceptos (para validar que NO es encabezado)
+# Palabras típicas de conceptos (para validar que NO es encabezado)
 CONCEPTO_KEYWORDS = [
     "transf", "inmediata", "ctas", "dist", "titular", "interbanking", "impuesto",
     "credito", "crédito", "debito", "débito", "comision", "comisión", "pago",
@@ -129,6 +132,14 @@ CONCEPTO_KEYWORDS = [
 
 def _is_amount(tok: str) -> bool:
     return bool(NUM_RE.match(tok or ""))
+
+def _is_pure_int(tok: str) -> bool:
+    return bool(PURE_INT_RE.match(tok or ""))
+
+def _is_code_like(tok: str) -> bool:
+    if not tok: return False
+    t = tok.strip().upper()
+    return (bool(CODE_ALPHA_NUM_RE.match(t)) and not _is_amount(t)) or bool(CODE_NUM_4_6_RE.match(t))
 
 def _is_alpha(tok: str) -> bool:
     if not tok: return False
@@ -162,21 +173,20 @@ def _group_lines(words, y_tol=3.0):
 
 def _find_first_movement_anchor(pages_lines):
     """
-    Encuentra el índice (page_idx, line_idx) de la primera línea que parezca
+    Encuentra (page_idx, line_idx, token_idx) de la primera línea que parezca
     un movimiento real: inicia con dd/mm/yyyy y luego hay concepto 'real'.
     """
     for p_idx, lines in enumerate(pages_lines):
         for l_idx, line in enumerate(lines):
-            if not line: 
+            if not line:
                 continue
-            # Buscar una fecha al inicio (o muy al principio de la línea)
-            for i, tok in enumerate(line[:3]):  # toleramos fecha en primeras 3 posiciones
+            # fecha en primeras 3 posiciones
+            for i, tok in enumerate(line[:3]):
                 if DATE_RE.match(tok):
-                    # El resto de la línea (y eventualmente la próxima) debe parecer concepto
                     tail = line[i+1:]
                     next_tail = lines[l_idx+1] if (l_idx + 1) < len(lines) else []
                     if _looks_like_concept(tail or next_tail):
-                        return (p_idx, l_idx, i)  # (página, línea, pos_fecha_en_linea)
+                        return (p_idx, l_idx, i)
     return None
 
 def _lines_from_anchor(pages_lines, anchor):
@@ -191,17 +201,9 @@ def _lines_from_anchor(pages_lines, anchor):
 
 def _parse_lines_to_records(lines):
     """
-    Convierte líneas (desde la primera fecha válida) a registros.
-    Regla: cada movimiento se abre con una fecha dd/mm/yyyy. 
-    Para cada bloque:
-      - Fecha = primer token fecha
-      - Tomamos los últimos 2 o 3 números del bloque como importes: 
-        * si hay 3 => Débito, Crédito, Saldo
-        * si hay 2 => Crédito, Saldo (Débito=0)
-      - Intentamos Nro.Cpbte. como el token inmediatamente anterior a los importes
-        si luce id corto [A-Za-z0-9-.]{3,12}
-      - Concepto = texto remanente entre Fecha y Nro/Primer Importe
-      - Cód. = vacío (suele no estar estable en texto plano)
+    Convierte líneas (desde la primera fecha válida) a registros multi-línea.
+    Regla: cada movimiento se abre con una fecha dd/mm/yyyy y termina justo
+    antes de la siguiente fecha.
     """
     records = []
     tokens = []
@@ -227,14 +229,21 @@ def _parse_lines_to_records(lines):
     return pd.DataFrame(records, columns=STANDARD_NAMES)
 
 def _chunk_to_record(chunk):
+    """
+    chunk = ['dd/mm/yyyy', ... hasta antes de la próxima 'dd/mm/yyyy']
+    Pasos:
+      1) encontrar los últimos 2/3 números (importes)
+      2) mirar hasta 3 tokens antes del primer importe y asignar Nro/Cód
+      3) resto = Concepto (multi-línea)
+    """
     # Limpia saltos
     chunk = [t for t in chunk if t != "<LB>"]
-    if not chunk or not DATE_RE.match(chunk[0]): 
+    if not chunk or not DATE_RE.match(chunk[0]):
         return None
 
     fecha, body = chunk[0], chunk[1:]
 
-    # Recolectar últimos 3 números (posibles importes)
+    # --- 1) Importes (al final del bloque)
     idx, nums, idxs = len(body) - 1, [], []
     while idx >= 0 and len(nums) < 3:
         t = body[idx]
@@ -242,7 +251,7 @@ def _chunk_to_record(chunk):
             nums.append(str(t)); idxs.append(idx)
         idx -= 1
     if len(nums) < 2:
-        # si no hay al menos 2 cifras, no lo consideramos movimiento completo
+        # pedimos al menos 2 importes (Crédito/Saldo o Débito/Saldo)
         return None
 
     nums_rev, idxs_rev = list(reversed(nums)), list(reversed(idxs))
@@ -251,29 +260,55 @@ def _chunk_to_record(chunk):
         deb, cred, saldo = nums_rev[0], nums_rev[1], nums_rev[2]
         first_amount_ix = idxs_rev[0]
     else:
-        # 2 números => Crédito, Saldo
+        # 2 números => asumimos Crédito, Saldo
         cred, saldo = nums_rev[0], nums_rev[1]
         first_amount_ix = idxs_rev[0]
 
-    # Nro.Cpbte.: token inmediatamente antes del primer importe, si parece id corto
+    # --- 2) Nro/Cód en los 1..3 tokens antes del primer importe
     nro = ""
-    candidate_ix = first_amount_ix - 1
-    if candidate_ix >= 0 and re.fullmatch(r"[A-Za-z0-9\-\.]{3,12}", str(body[candidate_ix])):
-        nro = str(body[candidate_ix])
-        concept_tokens = body[:candidate_ix]
-    else:
-        concept_tokens = body[:first_amount_ix]
+    cod = ""
+    lookback_start = max(0, first_amount_ix - 3)
+    back_tokens = body[lookback_start:first_amount_ix]
+    back_idx = list(range(lookback_start, first_amount_ix))
+
+    # priorizamos el token MÁS CERCANO a los importes como CÓDIGO si luce 'code-like'
+    for j in reversed(range(len(back_tokens))):
+        t = str(back_tokens[j]).strip().upper()
+        if not cod and _is_code_like(t):
+            cod = t
+            # marcamos para excluirlo del Concepto
+            back_tokens[j] = None
+
+    # el Nro es puramente dígitos y NO es importe (sin puntos/commas)
+    for j in reversed(range(len(back_tokens))):
+        t = back_tokens[j]
+        if t is None:
+            continue
+        t = str(t).strip()
+        if _is_pure_int(t):
+            nro = t
+            back_tokens[j] = None
+            break
+
+    # --- 3) Concepto = todo lo que queda ANTES del primer importe, quitando Nro/Cód
+    concept_tokens = []
+    # tokens antes de lookback_start
+    concept_tokens.extend(body[:lookback_start])
+    # tokens del lookback que no fueron Nro/Cód
+    concept_tokens.extend([t for t in back_tokens if t not in (None, "")])
 
     concepto = " ".join([t for t in concept_tokens if t])
-    return [fecha, concepto, nro, deb, cred, saldo, ""]
+
+    return [fecha, concepto, nro, deb, cred, saldo, cod]
 
 def parse_pdf_to_dataframe(uploaded_pdf, banco: str) -> pd.DataFrame:
     """
-    v19: 
+    v19.2: 
       1) Extrae palabras por página
       2) Detecta la PRIMERA fecha de movimiento 'real' -> descarta encabezado
-      3) Reconstruye filas (por texto) a partir de esa ancla
-      4) Devuelve DF con columnas estándar y solo movimientos válidos
+      3) Reconstruye filas multi-línea (por texto) a partir de esa ancla
+      4) Separa con heurística robusta Nro/Cód previos a importes
+      5) Devuelve DF con columnas estándar y solo movimientos válidos
     """
     pages_lines = []
     with pdfplumber.open(uploaded_pdf) as pdf:
@@ -312,8 +347,8 @@ def parse_pdf_to_dataframe(uploaded_pdf, banco: str) -> pd.DataFrame:
 # === STREAMLIT UI =========
 # ==========================
 
-st.set_page_config(page_title="Analizador Bancario (v19.1 PDF universal)", layout="wide")
-st.title("📊 Analizador de Conceptos Bancarios (v19.1, PDF universal con recorte de encabezado)")
+st.set_page_config(page_title="Analizador Bancario (v19.2 PDF universal)", layout="wide")
+st.title("📊 Analizador de Conceptos Bancarios (v19.2, PDF universal con recorte de encabezado)")
 
 # --- SELECCIÓN DE BANCO ---
 banco = st.selectbox("Seleccioná el banco:", ["Banco Credicoop", "Banco Galicia", "Banco Roela"])
@@ -418,7 +453,7 @@ if uploaded_file:
         st.success(f"Archivo cargado: {uploaded_file.name}")
         st.write("📑 Columnas detectadas:", list(df.columns))
 
-        # ⬇️ Nueva vista previa configurable (por defecto 1 fila)
+        # ⬇️ Vista previa configurable (por defecto 1 fila)
         show_preview(df)
 
         # --- DETECCIÓN/SELECCIÓN DE COLUMNAS ---
@@ -550,4 +585,4 @@ if uploaded_file:
 
 # --- VERSIÓN DEL SCRIPT ---
 st.markdown("---")
-st.markdown("🛠️ **Versión del script: v19.1**")
+st.markdown("🛠️ **Versión del script: v19.2**")
