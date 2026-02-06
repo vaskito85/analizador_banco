@@ -41,7 +41,7 @@ CONCEPTOS_ESPECIALES = {
 # ==========================
 
 def normalize_text(s: str) -> str:
-    """Minus, sin acentos, espacios colapsados, strip."""
+    """Minúsculas, sin acentos, espacios colapsados, strip."""
     if pd.isna(s):
         return ""
     s = str(s).strip().lower()
@@ -122,7 +122,7 @@ def _dedup_columns(cols):
     return out
 
 # ==========================
-# === PDF PARSER UNIVERSAL ==
+# === PDF PARSER UNIVERSAL (v18.1) ==
 # ==========================
 
 _DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
@@ -137,11 +137,9 @@ HEADER_ALIASES = {
     "saldo": ["saldo", "balance", "disponible", "contable"],
     "cod": ["cod", "cód", "codigo", "código"]
 }
-
 STANDARD_NAMES = ["Fecha", "Concepto", "Nro.Cpbte.", "Débito", "Crédito", "Saldo", "Cód."]
 
 def _best_name(colname_norm):
-    """Mapea un encabezado crudo a un nombre estándar, si calza."""
     for std, aliases in HEADER_ALIASES.items():
         if any(a in colname_norm for a in aliases):
             if std == "nro": return "Nro.Cpbte."
@@ -151,22 +149,18 @@ def _best_name(colname_norm):
             return std.capitalize()
     return None
 
-def _map_headers(cols):
-    """Intenta mapear columnas crudas a nombres estándar; conserva las que no mapean."""
-    mapped = []
-    used = set()
+def _map_headers(cols, normalize_text_fn):
+    mapped, used = [], set()
     for c in cols:
         name = str(c)
-        m = _best_name(normalize_text(name))
+        m = _best_name(normalize_text_fn(name))
         if m and m not in used:
-            mapped.append(m)
-            used.add(m)
+            mapped.append(m); used.add(m)
         else:
-            mapped.append(name)  # dejamos como está
+            mapped.append(name)
     return mapped
 
 def _extract_tables_all_strategies(pdf):
-    """Devuelve lista de tablas crudas (listas de filas) probando varias estrategias."""
     tables = []
     STRATS = [
         dict(vertical_strategy="lines", horizontal_strategy="lines",
@@ -179,75 +173,101 @@ def _extract_tables_all_strategies(pdf):
         for ts in STRATS:
             try:
                 t = page.extract_tables(table_settings=ts)
-                if t:
-                    page_tables.extend(t)
+                if t: page_tables.extend(t)
             except Exception:
                 continue
-        # fallback simple (sin settings)
         if not page_tables:
             try:
                 t = page.extract_tables()
-                if t:
-                    page_tables.extend(t)
+                if t: page_tables.extend(t)
             except Exception:
                 pass
         tables.extend(page_tables)
     return tables
 
-def _tables_to_df(tables):
-    """Convierte tablas crudas en un DF unificado, intentando detectar encabezados."""
+def _tables_to_df(tables, ensure_clean_columns_fn, normalize_text_fn):
     dfs = []
     for tbl in tables or []:
         if not tbl or len(tbl) == 0:
             continue
-        # Heurística de encabezado: si la primera fila tiene >2 celdas no vacías y hay filas debajo
         header, body = tbl[0], tbl[1:] if len(tbl) > 1 else (tbl[0], [])
         non_empty = sum(1 for c in header if c and str(c).strip())
-        # Si parece encabezado y hay cuerpo
         if non_empty >= 2 and len(body) >= 1:
             cols = [str(c) if c is not None else f"col_{i}" for i, c in enumerate(header)]
             df_tbl = pd.DataFrame(body, columns=cols)
         else:
-            df_tbl = pd.DataFrame(tbl)
+            df_tbl = pd.DataFrame(tbl)  # crudo; validaremos luego
         if df_tbl.shape[1] == 0:
             continue
         df_tbl.columns = _dedup_columns(df_tbl.columns)
-        # Intentar mapear encabezados a estándar
-        df_tbl.columns = _map_headers(df_tbl.columns)
+        df_tbl.columns = _map_headers(df_tbl.columns, normalize_text_fn)
         dfs.append(df_tbl)
     if not dfs:
         return pd.DataFrame()
-    # Unificamos por columnas (outer join-like, pero más simple: concatenamos y rellenamos faltantes)
     df = pd.concat(dfs, ignore_index=True, sort=False)
-    return ensure_clean_columns(df)
+    return ensure_clean_columns_fn(df)
+
+def _is_table_struct_valid(df, normalize_text_fn, min_rows=5, min_date_ratio=0.4):
+    """Aceptamos como 'tabla' solo si:
+       - hay Fecha y al menos un importe (Débito o Crédito o Saldo)
+       - hay suficientes filas
+       - % de fechas válidas (dd/mm/yyyy) supera el umbral
+    """
+    cols_norm = {c: normalize_text_fn(c) for c in df.columns}
+    has_fecha = any('fecha' in v or v == 'fec' or 'date' in v for v in cols_norm.values())
+    has_importe = any(normalize_text_fn(c) in ['debito', 'débito', 'debito', 'credito', 'crédito', 'saldo'] for c in df.columns)
+    if not (has_fecha and has_importe):
+        return False
+    fecha_col = None
+    for c in df.columns:
+        cn = normalize_text_fn(c)
+        if 'fecha' in cn or cn == 'fec' or 'date' in cn:
+            fecha_col = c; break
+    if fecha_col is None:
+        return False
+    if df.shape[0] < min_rows:
+        return False
+    vals = df[fecha_col].astype(str).str.strip()
+    valid_ratio = (vals.str.match(_DATE_RE).sum() / max(1, len(vals)))
+    return valid_ratio >= min_date_ratio
+
+def _coerce_to_standard(df, normalize_text_fn):
+    """Ajusta a 7 columnas estándar y filtra filas inválidas."""
+    colmap = {name: None for name in STANDARD_NAMES}
+    for c in df.columns:
+        b = _best_name(normalize_text_fn(c))
+        if b and colmap.get(b) is None:
+            colmap[b] = c
+    out = pd.DataFrame()
+    for std in STANDARD_NAMES:
+        if colmap[std] is not None:
+            out[std] = df[colmap[std]]
+        else:
+            out[std] = ""
+    mask_fecha = out["Fecha"].astype(str).str.match(_DATE_RE)
+    any_importe = (
+        out["Débito"].astype(str).str.contains(r"\d") |
+        out["Crédito"].astype(str).str.contains(r"\d") |
+        out["Saldo"].astype(str).str.contains(r"\d")
+    )
+    out = out[mask_fecha & any_importe].reset_index(drop=True)
+    return out
 
 def _words_to_records(pdf):
-    """
-    Reconstruye filas por texto:
-    - detecta inicio de fila por fecha dd/mm/yyyy
-    - toma los ÚLTIMOS 3 números como Débito, Crédito, Saldo
-    - el resto intermedio es Concepto; se intenta tomar Nro.Cpbte. si hay un num. 'aislado' justo antes de importes
-    """
+    """Reconstruye filas por texto (robusto a encabezados pegados y conceptos partidos)."""
     records = []
 
     def group_lines(words, y_tol=3.0):
-        # agrupa por hilera usando 'top' aproximado
         lines = []
         words_sorted = sorted(words, key=lambda w: (round(float(w["top"]), 1), float(w["x0"])))
-        current_y = None
-        current = []
+        current_y, current = None, []
         for w in words_sorted:
             y = float(w["top"])
             if current_y is None or abs(y - current_y) <= y_tol:
-                current.append(w)
-                current_y = y if current_y is None else (current_y + y) / 2.0
+                current.append(w); current_y = y if current_y is None else (current_y + y) / 2.0
             else:
-                lines.append(current)
-                current = [w]
-                current_y = y
-        if current:
-            lines.append(current)
-        # devuelve lista de líneas: cada línea es lista de palabras ordenadas por x
+                lines.append(current); current = [w]; current_y = y
+        if current: lines.append(current)
         return [[ww["text"] for ww in sorted(line, key=lambda x: float(x["x0"]))] for line in lines]
 
     for page in pdf.pages:
@@ -258,131 +278,94 @@ def _words_to_records(pdf):
         if not words:
             continue
         lines = group_lines(words)
-        # stream de tokens: línea a línea
+
         tokens = []
         for ln in lines:
-            # unimos por espacios, pero mantenemos tokens separados
-            tokens.extend(ln + ["<LB>"])  # marcador de salto de línea
+            tokens.extend(ln + ["<LB>"])
 
-        # cortar registros por fecha
         i, L = 0, len(tokens)
         while i < L:
-            if isinstance(tokens[i], str) and _DATE_RE.match(tokens[i]):
-                chunk = [tokens[i]]
-                i += 1
-                while i < L and not (_DATE_RE.match(tokens[i]) if isinstance(tokens[i], str) else False):
-                    chunk.append(tokens[i])
-                    i += 1
-                # parsear chunk -> registro
+            tok = tokens[i]
+            if isinstance(tok, str) and _DATE_RE.match(tok):
+                chunk = [tok]; i += 1
+                while i < L and not (isinstance(tokens[i], str) and _DATE_RE.match(tokens[i])):
+                    chunk.append(tokens[i]); i += 1
                 rec = _parse_chunk_to_record(chunk)
-                if rec:
-                    records.append(rec)
+                if rec: records.append(rec)
             else:
                 i += 1
 
     if not records:
         return pd.DataFrame()
-
-    df = pd.DataFrame(records, columns=["Fecha", "Concepto", "Nro.Cpbte.", "Débito", "Crédito", "Saldo", "Cód."])
-    return ensure_clean_columns(df)
+    df = pd.DataFrame(records, columns=STANDARD_NAMES)
+    return df
 
 def _parse_chunk_to_record(chunk):
-    """
-    chunk: [ 'dd/mm/yyyy', ..., '<LB>' ... ]
-    Heurística:
-      - Fecha = primer token
-      - Buscar desde el final 3 NUMÉRICOS -> (Débito, Crédito, Saldo) en ese orden (si no, intentar permutar)
-      - Intentar Nro.Cpbte. como el numérico inmediatamente anterior a los importes (si luce 'id' corto)
-      - Concepto = todo entre Fecha y ese Nro/primer importe
-      - Cód. = vacío (suele no venir estable en texto plano)
-    """
-    # limpiar '<LB>'
     chunk = [t for t in chunk if t != "<LB>"]
-    if not chunk or not _DATE_RE.match(chunk[0]):
-        return None
+    if not chunk or not _DATE_RE.match(chunk[0]): return None
+    fecha, body = chunk[0], chunk[1:]
 
-    fecha = chunk[0]
-    body = chunk[1:]
-
-    # tomar los últimos 5 tokens como candidatos a importes/cpbte/cod
-    # y expandir si hace falta
-    # estrategia: escanear desde el final, recolectar NUM hasta obtener 3
-    idx = len(body) - 1
-    nums = []
-    idxs = []
+    # Recolectar últimos 3 números (Débito, Crédito, Saldo)
+    idx, nums, idxs = len(body) - 1, [], []
     while idx >= 0 and len(nums) < 3:
         t = body[idx]
-        if _NUM_RE.match(t):
-            nums.append(t)
-            idxs.append(idx)
+        if _NUM_RE.match(str(t)):
+            nums.append(str(t)); idxs.append(idx)
         idx -= 1
     if len(nums) < 2:
-        return None  # no parece un movimiento completo
+        return None  # al menos 2 importes (Crédito/Saldo o Débito/Saldo)
 
-    # Los importes encontrados están al revés
-    nums_rev = list(reversed(nums))
-    idxs_rev = list(reversed(idxs))
-
-    # Asignación conservadora:
-    # - Si hay 3: Débito, Crédito, Saldo = nums_rev[0], nums_rev[1], nums_rev[2]
-    # - Si hay 2: asumimos Crédito, Saldo (o Débito, Saldo); dejamos el faltante en "0"
+    nums_rev, idxs_rev = list(reversed(nums)), list(reversed(idxs))
     deb, cred, saldo = "0", "0", "0"
     if len(nums_rev) == 3:
         deb, cred, saldo = nums_rev[0], nums_rev[1], nums_rev[2]
         first_amount_ix = idxs_rev[0]
     else:
-        # 2 números: damos prioridad a "Saldo" como el último
-        saldo = nums_rev[-1]
+        cred, saldo = nums_rev[0], nums_rev[1]
         first_amount_ix = idxs_rev[0]
-        # el restante lo consideramos Crédito
-        cred = nums_rev[0]
 
-    # Intento de Nro.Cpbte.: token inmediatamente antes del primer importe, si es un número "de id"
+    # Nro.Cpbte.: token inmediatamente antes del primer importe, si parece id corto
     nro = ""
     candidate_ix = first_amount_ix - 1
-    if candidate_ix >= 0 and re.fullmatch(r"[A-Za-z0-9\-\.]{3,12}", body[candidate_ix]):
-        nro = body[candidate_ix]
-        concept_tokens = body[:candidate_ix]
+    if candidate_ix >= 0 and re.fullmatch(r"[A-Za-z0-9\-\.]{3,12}", str(body[candidate_ix])):
+        nro = str(body[candidate_ix]); concept_tokens = body[:candidate_ix]
     else:
         concept_tokens = body[:first_amount_ix]
 
     concepto = " ".join([t for t in concept_tokens if t])
-
     return [fecha, concepto, nro, deb, cred, saldo, ""]
 
 def parse_pdf_to_dataframe(uploaded_pdf, banco: str) -> pd.DataFrame:
     """
-    Parser PDF universal:
-      1) intenta tablas con varias estrategias
-      2) si falla o no hay columnas útiles, reconstruye por texto (words)
+    1) Intenta 'tablas' con múltiples estrategias
+    2) Valida estructura (fechas reales, columnas clave, filas suficientes)
+    3) Si falla, reconstruye por 'words' (texto)
+    4) Devuelve 7 columnas estándar y solo filas válidas
     """
     with pdfplumber.open(uploaded_pdf) as pdf:
-        # 1) Tablas
         tables = _extract_tables_all_strategies(pdf)
-        df_tables = _tables_to_df(tables)
-        usable = (not df_tables.empty) and (df_tables.shape[0] > 0)
+        df_tables = _tables_to_df(tables, ensure_clean_columns, normalize_text)
+        if not df_tables.empty and _is_table_struct_valid(df_tables, normalize_text):
+            df_std = _coerce_to_standard(df_tables, normalize_text)
+            if not df_std.empty:
+                return ensure_clean_columns(df_std)
 
-        # ¿tenemos algo parecido a columnas clave?
-        has_any_core = any(_best_name(normalize_text(c)) in ["Fecha", "Concepto", "Débito", "Crédito", "Saldo", "Nro.Cpbte.", "Cód."]
-                           for c in df_tables.columns) if usable else False
-
-        if usable and has_any_core:
-            return df_tables
-
-        # 2) Reconstrucción por words
+        # Fallback robusto por texto
         df_words = _words_to_records(pdf)
         if not df_words.empty:
-            return df_words
+            df_std = _coerce_to_standard(df_words, normalize_text)
+            if not df_std.empty:
+                return ensure_clean_columns(df_std)
 
-    # si nada funcionó:
+    # Si nada funcionó, devolvemos DF vacío para informar en la UI
     return pd.DataFrame()
 
 # ==========================
 # === STREAMLIT UI =========
 # ==========================
 
-st.set_page_config(page_title="Analizador Bancario (v18 PDF universal)", layout="wide")
-st.title("📊 Analizador de Conceptos Bancarios (v18, PDF universal)")
+st.set_page_config(page_title="Analizador Bancario (v18.1 PDF universal)", layout="wide")
+st.title("📊 Analizador de Conceptos Bancarios (v18.1, PDF universal)")
 
 # --- SELECCIÓN DE BANCO ---
 banco = st.selectbox("Seleccioná el banco:", ["Banco Credicoop", "Banco Galicia", "Banco Roela"])
@@ -481,7 +464,6 @@ if uploaded_file:
         # --- DETECCIÓN/SELECCIÓN DE COLUMNAS ---
         concept_aliases = ["concepto", "descripcion", "descripción", "detalle", "concept", "desc"]
         debit_aliases   = ["debito", "débito", "debitos", "débitos", "monto", "importe", "importe debito", "importe débito", "debe"]
-        # Defaults si existen; si no, adivinamos por alias
         col_concepto_guess = default_concept_col if default_concept_col in df.columns else (guess_column(df, concept_aliases) or df.columns[0])
         col_debito_guess   = default_debito_col   if default_debito_col   in df.columns else (guess_column(df, debit_aliases)   or df.columns[min(1, len(df.columns)-1)])
 
@@ -608,4 +590,4 @@ if uploaded_file:
 
 # --- VERSIÓN DEL SCRIPT ---
 st.markdown("---")
-st.markdown("🛠️ **Versión del script: v18 (PDF universal, sin gráfico)**")
+st.markdown("🛠️ **Versión del script: v18.1**")
