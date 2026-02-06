@@ -3,7 +3,6 @@ import pandas as pd
 import re
 import unicodedata
 from io import BytesIO
-import pdfplumber  # Parser PDF (texto seleccionable)
 
 # ==========================
 # === CONFIG GENERAL =======
@@ -56,17 +55,20 @@ def formato_argentino(valor):
         return valor
 
 def parse_amount(x):
-    """Parsea importes en formatos variados y devuelve float o NaN (robusto AR/US, paréntesis)."""
+    """Parsea importes AR/US y contables con paréntesis, devolviendo float o NaN."""
     if pd.isna(x):
         return float('nan')
     s = str(x)
     negative = False
     if '(' in s and ')' in s:
         negative = True
-    s = re.sub(r'[^0-9,.\-]', '', s)  # quita símbolos no numéricos (excepto . , -)
+    # deja solo dígitos, coma, punto y menos
+    s = re.sub(r'[^0-9,.\-]', '', s)
+    # Si tiene coma y punto, asumimos punto miles y coma decimal (estilo AR/UE)
     if ',' in s and '.' in s:
-        s = s.replace('.', '')   # quita miles
-        s = s.replace(',', '.')  # usa punto decimal
+        s = s.replace('.', '')
+        s = s.replace(',', '.')
+    # Si solo hay coma, la tratamos como decimal
     elif ',' in s and '.' not in s:
         s = s.replace(',', '.')
     try:
@@ -85,7 +87,7 @@ def find_fecha_column(df):
     return None
 
 def guess_column(df, candidates):
-    """Busca una columna conteniendo alguno de los alias indicados."""
+    """Busca una columna que contenga alguno de los alias indicados."""
     cols_norm = {col: normalize_text(col) for col in df.columns}
     for alias in candidates:
         for col, cn in cols_norm.items():
@@ -94,14 +96,13 @@ def guess_column(df, candidates):
     return None
 
 def ensure_clean_columns(df):
-    # Limpia nombres y valores tipo texto
+    # Limpia nombres de columnas y strings
     df.columns = (pd.Index(df.columns)
                     .astype(str)
                     .str.strip()
                     .str.replace(r'\s+', ' ', regex=True))
     for col in df.select_dtypes(include=['object']).columns:
         df[col] = df[col].astype(str).str.strip()
-    df = df.dropna(how='all')
     return df
 
 def conceptos_regex(keywords):
@@ -109,246 +110,11 @@ def conceptos_regex(keywords):
     return r'(' + '|'.join(kws) + r')'
 
 # ==========================
-# === PDF PARSER (v19.2) ===
-# ==========================
-
-# Patrones generales
-DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
-NUM_RE  = re.compile(r"^[\(\)\-\s\$]*\d{1,3}(\.\d{3})*(,\d+)?$|^[\(\)\-\s\$]*\d+(\.\d+)?$")  # números/monedas
-PURE_INT_RE = re.compile(r"^\d{1,12}$")  # id simple (sin coma/punto)
-CODE_ALPHA_NUM_RE = re.compile(r"^[A-Z0-9]{3,8}$")  # códigos tipo IDCC1 / IVA05
-CODE_NUM_4_6_RE = re.compile(r"^\d{4,6}$")          # códigos numéricos cortos, p.ej. 01872
-
-STANDARD_NAMES = ["Fecha", "Concepto", "Nro.Cpbte.", "Débito", "Crédito", "Saldo", "Cód."]
-
-# Palabras típicas de conceptos (para validar que NO es encabezado)
-CONCEPTO_KEYWORDS = [
-    "transf", "inmediata", "ctas", "dist", "titular", "interbanking", "impuesto",
-    "credito", "crédito", "debito", "débito", "comision", "comisión", "pago",
-    "servicio", "suscripcion", "suscripción", "debin", "deposito", "depósito",
-    "transfer", "cuentas", "obligaciones", "siro", "haberes", "consorcio", "arca",
-    "vep", "iva", "ali", "ley", "periodico", "periódico", "accion", "acción",
-]
-
-def _is_amount(tok: str) -> bool:
-    return bool(NUM_RE.match(tok or ""))
-
-def _is_pure_int(tok: str) -> bool:
-    return bool(PURE_INT_RE.match(tok or ""))
-
-def _is_code_like(tok: str) -> bool:
-    if not tok: return False
-    t = tok.strip().upper()
-    return (bool(CODE_ALPHA_NUM_RE.match(t)) and not _is_amount(t)) or bool(CODE_NUM_4_6_RE.match(t))
-
-def _is_alpha(tok: str) -> bool:
-    if not tok: return False
-    t = re.sub(r'[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ]', '', tok)
-    return len(t) >= 2
-
-def _looks_like_concept(tokens_after_date) -> bool:
-    """Debe existir texto alfabético o keywords típicas (evita tomar encabezados)."""
-    tail = " ".join([t for t in tokens_after_date if t and t != "<LB>"]).lower()
-    has_alpha = any(_is_alpha(t) for t in tokens_after_date)
-    has_kw = any(k in tail for k in CONCEPTO_KEYWORDS)
-    return has_alpha or has_kw
-
-def _group_lines(words, y_tol=3.0):
-    """Agrupa palabras en líneas según coordenada 'top' (tolerancia)."""
-    lines = []
-    words_sorted = sorted(words, key=lambda w: (round(float(w["top"]), 1), float(w["x0"])))
-    current_y, current = None, []
-    for w in words_sorted:
-        y = float(w["top"])
-        if current_y is None or abs(y - current_y) <= y_tol:
-            current.append(w)
-            current_y = y if current_y is None else (current_y + y) / 2.0
-        else:
-            lines.append(current)
-            current = [w]
-            current_y = y
-    if current: lines.append(current)
-    # Cada línea como lista de strings, ordenada por x
-    return [[ww["text"] for ww in sorted(line, key=lambda x: float(x["x0"]))] for line in lines]
-
-def _find_first_movement_anchor(pages_lines):
-    """
-    Encuentra (page_idx, line_idx, token_idx) de la primera línea que parezca
-    un movimiento real: inicia con dd/mm/yyyy y luego hay concepto 'real'.
-    """
-    for p_idx, lines in enumerate(pages_lines):
-        for l_idx, line in enumerate(lines):
-            if not line:
-                continue
-            # fecha en primeras 3 posiciones
-            for i, tok in enumerate(line[:3]):
-                if DATE_RE.match(tok):
-                    tail = line[i+1:]
-                    next_tail = lines[l_idx+1] if (l_idx + 1) < len(lines) else []
-                    if _looks_like_concept(tail or next_tail):
-                        return (p_idx, l_idx, i)
-    return None
-
-def _lines_from_anchor(pages_lines, anchor):
-    """Devuelve todas las líneas desde el ancla (incluida), como lista única."""
-    p0, l0, _ = anchor
-    out = []
-    for p_idx in range(p0, len(pages_lines)):
-        lines = pages_lines[p_idx]
-        start = l0 if p_idx == p0 else 0
-        out.extend(lines[start:])
-    return out
-
-def _parse_lines_to_records(lines):
-    """
-    Convierte líneas (desde la primera fecha válida) a registros multi-línea.
-    Regla: cada movimiento se abre con una fecha dd/mm/yyyy y termina justo
-    antes de la siguiente fecha.
-    """
-    records = []
-    tokens = []
-    for ln in lines:
-        tokens.extend(ln + ["<LB>"])
-
-    i, L = 0, len(tokens)
-    while i < L:
-        tok = tokens[i]
-        if isinstance(tok, str) and DATE_RE.match(tok):
-            chunk = [tok]
-            i += 1
-            while i < L and not (isinstance(tokens[i], str) and DATE_RE.match(tokens[i])):
-                chunk.append(tokens[i]); i += 1
-            rec = _chunk_to_record(chunk)
-            if rec:
-                records.append(rec)
-        else:
-            i += 1
-
-    if not records:
-        return pd.DataFrame(columns=STANDARD_NAMES)
-    return pd.DataFrame(records, columns=STANDARD_NAMES)
-
-def _chunk_to_record(chunk):
-    """
-    chunk = ['dd/mm/yyyy', ... hasta antes de la próxima 'dd/mm/yyyy']
-    Pasos:
-      1) encontrar los últimos 2/3 números (importes)
-      2) mirar hasta 3 tokens antes del primer importe y asignar Nro/Cód
-      3) resto = Concepto (multi-línea)
-    """
-    # Limpia saltos
-    chunk = [t for t in chunk if t != "<LB>"]
-    if not chunk or not DATE_RE.match(chunk[0]):
-        return None
-
-    fecha, body = chunk[0], chunk[1:]
-
-    # --- 1) Importes (al final del bloque)
-    idx, nums, idxs = len(body) - 1, [], []
-    while idx >= 0 and len(nums) < 3:
-        t = body[idx]
-        if _is_amount(str(t)):
-            nums.append(str(t)); idxs.append(idx)
-        idx -= 1
-    if len(nums) < 2:
-        # pedimos al menos 2 importes (Crédito/Saldo o Débito/Saldo)
-        return None
-
-    nums_rev, idxs_rev = list(reversed(nums)), list(reversed(idxs))
-    deb, cred, saldo = "0", "0", "0"
-    if len(nums_rev) == 3:
-        deb, cred, saldo = nums_rev[0], nums_rev[1], nums_rev[2]
-        first_amount_ix = idxs_rev[0]
-    else:
-        # 2 números => asumimos Crédito, Saldo
-        cred, saldo = nums_rev[0], nums_rev[1]
-        first_amount_ix = idxs_rev[0]
-
-    # --- 2) Nro/Cód en los 1..3 tokens antes del primer importe
-    nro = ""
-    cod = ""
-    lookback_start = max(0, first_amount_ix - 3)
-    back_tokens = body[lookback_start:first_amount_ix]
-    back_idx = list(range(lookback_start, first_amount_ix))
-
-    # priorizamos el token MÁS CERCANO a los importes como CÓDIGO si luce 'code-like'
-    for j in reversed(range(len(back_tokens))):
-        t = str(back_tokens[j]).strip().upper()
-        if not cod and _is_code_like(t):
-            cod = t
-            # marcamos para excluirlo del Concepto
-            back_tokens[j] = None
-
-    # el Nro es puramente dígitos y NO es importe (sin puntos/commas)
-    for j in reversed(range(len(back_tokens))):
-        t = back_tokens[j]
-        if t is None:
-            continue
-        t = str(t).strip()
-        if _is_pure_int(t):
-            nro = t
-            back_tokens[j] = None
-            break
-
-    # --- 3) Concepto = todo lo que queda ANTES del primer importe, quitando Nro/Cód
-    concept_tokens = []
-    # tokens antes de lookback_start
-    concept_tokens.extend(body[:lookback_start])
-    # tokens del lookback que no fueron Nro/Cód
-    concept_tokens.extend([t for t in back_tokens if t not in (None, "")])
-
-    concepto = " ".join([t for t in concept_tokens if t])
-
-    return [fecha, concepto, nro, deb, cred, saldo, cod]
-
-def parse_pdf_to_dataframe(uploaded_pdf, banco: str) -> pd.DataFrame:
-    """
-    v19.2: 
-      1) Extrae palabras por página
-      2) Detecta la PRIMERA fecha de movimiento 'real' -> descarta encabezado
-      3) Reconstruye filas multi-línea (por texto) a partir de esa ancla
-      4) Separa con heurística robusta Nro/Cód previos a importes
-      5) Devuelve DF con columnas estándar y solo movimientos válidos
-    """
-    pages_lines = []
-    with pdfplumber.open(uploaded_pdf) as pdf:
-        for page in pdf.pages:
-            try:
-                words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
-            except Exception:
-                words = []
-            lines = _group_lines(words) if words else []
-            pages_lines.append(lines)
-
-    anchor = _find_first_movement_anchor(pages_lines)
-    if not anchor:
-        # Si no pudimos detectar la primera fila válida, devolvemos vacío
-        return pd.DataFrame(columns=STANDARD_NAMES)
-
-    work_lines = _lines_from_anchor(pages_lines, anchor)
-    df = _parse_lines_to_records(work_lines)
-
-    # Filtrado final: Fecha válida + al menos un importe con dígitos
-    if df.empty:
-        return df
-    df = ensure_clean_columns(df)
-
-    mask_fecha = df["Fecha"].astype(str).str.match(DATE_RE)
-    any_importe = (
-        df["Débito"].astype(str).str.contains(r"\d") |
-        df["Crédito"].astype(str).str.contains(r"\d") |
-        df["Saldo"].astype(str).str.contains(r"\d")
-    )
-    df = df[mask_fecha & any_importe].reset_index(drop=True)
-
-    return df
-
-# ==========================
 # === STREAMLIT UI =========
 # ==========================
 
-st.set_page_config(page_title="Analizador Bancario (v19.2 PDF universal)", layout="wide")
-st.title("📊 Analizador de Conceptos Bancarios (v19.2, PDF universal con recorte de encabezado)")
+st.set_page_config(page_title="Analizador Bancario (v20 CSV/Excel)", layout="wide")
+st.title("📊 Analizador de Conceptos Bancarios (v20, CSV/Excel)")
 
 # --- SELECCIÓN DE BANCO ---
 banco = st.selectbox("Seleccioná el banco:", ["Banco Credicoop", "Banco Galicia", "Banco Roela"])
@@ -394,7 +160,7 @@ else:  # Banco Roela
     invertir_signo = True
 
 st.write(f"Configurado para **{banco}** (columnas objetivo por defecto: **{default_concept_col}** / **{default_debito_col}**).")
-st.write("Subí un Excel/CSV/PDF para analizar.")
+st.write("Subí un **Excel/CSV** para analizar (PDF deshabilitado en v20).")
 
 # Parámetros de carga CSV
 c1, c2 = st.columns(2)
@@ -404,7 +170,7 @@ with c2:
     csv_enc = st.selectbox("Encoding CSV", ["latin1", "utf-8", "cp1252"], index=0, help="Solo afecta si subís CSV")
 
 # --- CARGA DE ARCHIVO ---
-uploaded_file = st.file_uploader("Elegir archivo", type=["csv", "xlsx", "xls", "pdf"])
+uploaded_file = st.file_uploader("Elegir archivo", type=["csv", "xlsx", "xls"])
 
 # --- Vista previa configurable ---
 def show_preview(df: pd.DataFrame):
@@ -430,21 +196,12 @@ if uploaded_file:
                 sep=sep_map[csv_sep],
                 on_bad_lines='skip'
             )
-            df = ensure_clean_columns(df)
+        else:  # Excel
+            # Para .xlsx usa openpyxl; para .xls, xlrd si está disponible
+            engine = "openpyxl" if file_name.endswith(".xlsx") else None
+            df = pd.read_excel(uploaded_file, engine=engine)
 
-        elif file_name.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(uploaded_file)
-            df = ensure_clean_columns(df)
-
-        elif file_name.endswith(".pdf"):
-            st.info("Procesando PDF… puede tardar unos segundos.")
-            df = parse_pdf_to_dataframe(uploaded_file, banco=banco)
-            if df.empty or df.columns.size == 0:
-                st.error("No se detectaron movimientos útiles en el PDF. Si es escaneado (imagen), se requiere OCR.")
-                st.stop()
-        else:
-            st.error("Formato no soportado.")
-            st.stop()
+        df = ensure_clean_columns(df)
 
         if df.empty or df.columns.size == 0:
             st.error("El archivo está vacío o no tiene columnas reconocibles.")
@@ -453,12 +210,13 @@ if uploaded_file:
         st.success(f"Archivo cargado: {uploaded_file.name}")
         st.write("📑 Columnas detectadas:", list(df.columns))
 
-        # ⬇️ Vista previa configurable (por defecto 1 fila)
+        # Vista preliminar configurable
         show_preview(df)
 
         # --- DETECCIÓN/SELECCIÓN DE COLUMNAS ---
         concept_aliases = ["concepto", "descripcion", "descripción", "detalle", "concept", "desc"]
         debit_aliases   = ["debito", "débito", "debitos", "débitos", "monto", "importe", "importe debito", "importe débito", "debe"]
+
         col_concepto_guess = default_concept_col if default_concept_col in df.columns else (guess_column(df, concept_aliases) or df.columns[0])
         col_debito_guess   = default_debito_col   if default_debito_col   in df.columns else (guess_column(df, debit_aliases)   or df.columns[min(1, len(df.columns)-1)])
 
@@ -490,7 +248,12 @@ if uploaded_file:
 
         # --- Filtro por fecha opcional ---
         if fecha_col:
-            df["_fecha_parse"] = pd.to_datetime(df[fecha_col], errors="coerce", dayfirst=True, infer_datetime_format=True)
+            df["_fecha_parse"] = pd.to_datetime(
+                df[fecha_col],
+                errors="coerce",
+                dayfirst=True,
+                infer_datetime_format=True
+            )
             min_f, max_f = pd.to_datetime(df["_fecha_parse"].min()), pd.to_datetime(df["_fecha_parse"].max())
             if pd.notna(min_f) and pd.notna(max_f):
                 st.markdown("#### Filtro por fecha")
@@ -521,7 +284,10 @@ if uploaded_file:
 
         summary = pd.DataFrame(resumen_items, columns=["Concepto", "Total Débito"])
         total_general = summary["Total Débito"].sum()
-        summary = pd.concat([summary, pd.DataFrame([["TOTAL GENERAL", total_general]], columns=["Concepto", "Total Débito"])], ignore_index=True)
+        summary = pd.concat(
+            [summary, pd.DataFrame([["TOTAL GENERAL", total_general]], columns=["Concepto", "Total Débito"])],
+            ignore_index=True
+        )
         summary["Total Débito"] = summary["Total Débito"].apply(formato_argentino)
 
         # --- CONCEPTOS ESPECIALES ---
@@ -585,4 +351,4 @@ if uploaded_file:
 
 # --- VERSIÓN DEL SCRIPT ---
 st.markdown("---")
-st.markdown("🛠️ **Versión del script: v19.2**")
+st.markdown("🛠️ **Versión del script: v20**")
