@@ -175,7 +175,6 @@ def _find_first_movement_anchor(pages_lines):
                     # El resto de la línea (y eventualmente la próxima) debe parecer concepto
                     tail = line[i+1:]
                     next_tail = lines[l_idx+1] if (l_idx + 1) < len(lines) else []
-                    # Validamos por texto alfabético/keywords en tail+next_tail
                     if _looks_like_concept(tail or next_tail):
                         return (p_idx, l_idx, i)  # (página, línea, pos_fecha_en_linea)
     return None
@@ -205,7 +204,6 @@ def _parse_lines_to_records(lines):
       - Cód. = vacío (suele no estar estable en texto plano)
     """
     records = []
-    # Convertimos todas las líneas a tokens con saltos explícitos
     tokens = []
     for ln in lines:
         tokens.extend(ln + ["<LB>"])
@@ -314,8 +312,8 @@ def parse_pdf_to_dataframe(uploaded_pdf, banco: str) -> pd.DataFrame:
 # === STREAMLIT UI =========
 # ==========================
 
-st.set_page_config(page_title="Analizador Bancario (v19 PDF universal)", layout="wide")
-st.title("📊 Analizador de Conceptos Bancarios (v19, PDF universal con recorte de encabezado)")
+st.set_page_config(page_title="Analizador Bancario (v19.1 PDF universal)", layout="wide")
+st.title("📊 Analizador de Conceptos Bancarios (v19.1, PDF universal con recorte de encabezado)")
 
 # --- SELECCIÓN DE BANCO ---
 banco = st.selectbox("Seleccioná el banco:", ["Banco Credicoop", "Banco Galicia", "Banco Roela"])
@@ -373,6 +371,17 @@ with c2:
 # --- CARGA DE ARCHIVO ---
 uploaded_file = st.file_uploader("Elegir archivo", type=["csv", "xlsx", "xls", "pdf"])
 
+# --- Vista previa configurable ---
+def show_preview(df: pd.DataFrame):
+    st.markdown("### 🧾 Vista preliminar")
+    n = st.selectbox(
+        "Cantidad de filas a mostrar",
+        options=[1, 5, 10, 15, 20],
+        index=0,  # por defecto 1
+        help="Mostramos la primera N filas del archivo ya parseado."
+    )
+    st.dataframe(df.head(n))
+
 if uploaded_file:
     try:
         file_name = uploaded_file.name.lower()
@@ -408,8 +417,9 @@ if uploaded_file:
 
         st.success(f"Archivo cargado: {uploaded_file.name}")
         st.write("📑 Columnas detectadas:", list(df.columns))
-        st.markdown("### 🧾 Vista preliminar (1ª fila)")
-        st.dataframe(df.head(1))
+
+        # ⬇️ Nueva vista previa configurable (por defecto 1 fila)
+        show_preview(df)
 
         # --- DETECCIÓN/SELECCIÓN DE COLUMNAS ---
         concept_aliases = ["concepto", "descripcion", "descripción", "detalle", "concept", "desc"]
@@ -540,4 +550,4 @@ if uploaded_file:
 
 # --- VERSIÓN DEL SCRIPT ---
 st.markdown("---")
-st.markdown("🛠️ **Versión del script: v19**")
+st.markdown("🛠️ **Versión del script: v19.1**")
